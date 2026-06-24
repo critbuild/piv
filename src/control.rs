@@ -20,6 +20,7 @@ pub struct ControlServer {
 
 impl ControlServer {
     pub fn start(root: &Path, tx: mpsc::Sender<ControlCommand>) -> Result<Self> {
+        // Listen for newline-delimited control messages from remote `piv`.
         let path = control_socket_path(root);
         if path.exists() { let _ = fs::remove_file(&path); }
         let listener = UnixListener::bind(&path)
@@ -44,6 +45,7 @@ impl Drop for ControlServer {
 }
 
 pub fn send_control_command(root: &Path, command: &ControlCommand) -> Result<()> {
+    // Serialize one command and push it into the running viewer's socket.
     let socket_path = control_socket_path(root);
     let mut stream = UnixStream::connect(&socket_path)
         .with_context(|| format!("no running piv for {} at {}", root.display(), socket_path.display()))?;
@@ -65,6 +67,7 @@ pub fn encode_control_command(command: &ControlCommand) -> String {
 }
 
 pub fn parse_control_message(line: &str) -> Option<ControlCommand> {
+    // Decode the tiny text protocol used by the control socket.
     let line = line.trim();
     if let Some(rest) = line.strip_prefix("open ") { return parse_open_command(rest).ok(); }
     if let Some(rest) = line.strip_prefix("line ") { return rest.parse().ok().map(ControlCommand::Line); }

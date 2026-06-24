@@ -1,12 +1,15 @@
-use std::{collections::HashMap, fs, path::{Path, PathBuf}, sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError}, time::{Duration, Instant, SystemTime}};
+use std::{collections::HashMap, fs, io::Write, path::{Path, PathBuf}, process::{Child, Command, Stdio}, sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError}, time::{Duration, Instant, SystemTime}};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local};
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{backend::CrosstermBackend, layout::{Constraint, Direction, Layout, Rect}, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::{Block, Borders, Paragraph}, Frame, Terminal};
+use similar::TextDiff;
 use walkdir::WalkDir;
 
 use crate::{control::{ControlCommand, ControlServer}, diff::{DiffEngine, LineKind}, highlight::{default_code_style, Highlighter}, model::{Selection, Tab, TabManager, TextPoint}, watcher::{FileWatcher, IgnorePolicy, WatchEvent}};
+
+use arboard::Clipboard;
 
 const MAX_TABS: usize = 10;
 const BATCH_WINDOW: Duration = Duration::from_millis(120);
@@ -21,10 +24,13 @@ pub struct App {
     tabs: TabManager,
     snapshots: HashMap<PathBuf, String>,
     highlighter: Highlighter,
+    clipboard: Option<Clipboard>,
+    clipboard_process: Option<Child>,
     tab_area: Rect,
     code_area: Rect,
     mouse_selecting: bool,
     last_change: Option<SystemTime>,
+    copy_notice_until: Option<Instant>,
 }
 
 impl App {
@@ -42,10 +48,13 @@ impl App {
             tabs: TabManager::new(MAX_TABS),
             snapshots: HashMap::new(),
             highlighter: Highlighter::new()?,
+            clipboard: Clipboard::new().ok(),
+            clipboard_process: None,
             tab_area: Rect::default(),
             code_area: Rect::default(),
             mouse_selecting: false,
             last_change: None,
+            copy_notice_until: None,
         };
         app.open_initial_file()?;
         Ok(app)
@@ -130,8 +139,7 @@ impl App {
         let path = if path.is_absolute() { path } else { self.root.join(path) };
         let path = path.canonicalize().with_context(|| format!("open target does not exist: {}", path.display()))?;
         let content = fs::read_to_string(&path).unwrap_or_else(|_| "<binary or unreadable file>".into());
-        let old = self.snapshots.get(&path).cloned().unwrap_or_else(|| content.clone());
-        let diff = DiffEngine::diff(&old, &content);
+        let diff = self.diff_for_path(&path, &content);
         let highlighted_lines = self.highlighter.highlight_lines(&path, &content);
         let first_change = diff.iter().position(|l| l.kind != LineKind::Unchanged);
         self.snapshots.entry(path.clone()).or_insert_with(|| content.clone());
@@ -152,15 +160,62 @@ impl App {
 
     fn load_change(&mut self, path: PathBuf, at: SystemTime) -> Result<()> {
         let content = fs::read_to_string(&path).unwrap_or_else(|_| "<binary or unreadable file>".into());
-        let old = self.snapshots.get(&path).cloned().unwrap_or_else(|| content.clone());
-        let diff = DiffEngine::diff(&old, &content);
+        let old_snapshot = self.snapshots.get(&path).cloned().unwrap_or_else(|| content.clone());
+        let diff = self.diff_for_path(&path, &content);
         let highlighted_lines = self.highlighter.highlight_lines(&path, &content);
         let first_change = diff.iter().position(|l| l.kind != LineKind::Unchanged);
+        let focus_line = latest_snapshot_change_line(&old_snapshot, &content).or_else(|| diff.iter().rposition(|l| l.kind != LineKind::Unchanged));
         self.snapshots.insert(path.clone(), content.clone());
-        let tab = Tab { path, content, highlighted_lines, diff, first_change, focus_line: first_change, scroll: 0, auto_center: true, selection: None, last_edit: at };
+        let tab = Tab { path, content, highlighted_lines, diff, first_change, focus_line, scroll: 0, auto_center: true, selection: None, last_edit: at };
         self.last_change = Some(at);
         self.tabs.add_or_bring_to_front(tab);
         Ok(())
+    }
+
+    fn diff_for_path(&self, path: &Path, content: &str) -> Vec<crate::diff::DiffLine> {
+        if let Some(lines) = self.git_diff_lines(path, content) {
+            return lines;
+        }
+        let old = self.snapshots.get(path).map(String::as_str).unwrap_or("");
+        DiffEngine::diff(old, content)
+    }
+
+    fn git_diff_lines(&self, path: &Path, content: &str) -> Option<Vec<crate::diff::DiffLine>> {
+        let rel = path.strip_prefix(&self.root).unwrap_or(path);
+        let output = Command::new("git")
+            .arg("-C").arg(&self.root)
+            .args(["diff", "--unified=0", "--no-color", "--", &rel.to_string_lossy()])
+            .output()
+            .ok()?;
+        if !output.status.success() { return None; }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim().is_empty() {
+            return Some(content.lines().map(|line| crate::diff::DiffLine { kind: crate::diff::LineKind::Unchanged, text: line.to_string() }).collect());
+        }
+        let mut lines = Vec::new();
+        for (idx, text) in content.lines().enumerate() {
+            let kind = match self.git_line_kind(&stdout, idx + 1) {
+                Some(kind) => kind,
+                None => crate::diff::LineKind::Unchanged,
+            };
+            lines.push(crate::diff::DiffLine { kind, text: text.to_string() });
+        }
+        Some(lines)
+    }
+
+    fn git_line_kind(&self, diff: &str, line_no: usize) -> Option<crate::diff::LineKind> {
+        let mut changed = false;
+        for hunk in diff.lines().filter(|l| l.starts_with("@@ ")) {
+            let (old_range, new_range) = hunk.strip_prefix("@@ ")?.split_once(" @@")?;
+            let (_old_start, old_count) = parse_hunk_range(old_range, '-')?;
+            let (new_start, new_count) = parse_hunk_range(new_range, '+')?;
+            let end = new_start + new_count.saturating_sub(1);
+            if (new_start..=end).contains(&line_no) {
+                if new_count > old_count { return Some(crate::diff::LineKind::Added); }
+                changed = true;
+            }
+        }
+        if changed { Some(crate::diff::LineKind::Modified) } else { None }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -205,7 +260,10 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => { self.mouse_selecting = false; }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.mouse_selecting = false;
+                self.copy_selection_to_clipboard();
+            }
             _ => {}
         }
     }
@@ -265,12 +323,13 @@ impl App {
     }
 
     fn render_status(&self, f: &mut Frame, area: Rect) {
+        let copied = self.copy_notice_until.is_some_and(|until| until > Instant::now());
         let text = if let Some(tab) = self.tabs.current() {
             let rel = tab.path.strip_prefix(&self.root).unwrap_or(&tab.path).display();
             let changes = tab.diff.iter().filter(|l| l.kind != LineKind::Unchanged).count();
             let ts: DateTime<Local> = tab.last_edit.into();
-            format!("{} | {} lines | {} changes | tab {}/{} | last edit {} | {}", rel, tab.content.lines().count(), changes, self.tabs.active + 1, self.tabs.len(), ts.format("%H:%M:%S"), if self.last_change.is_some() { "idle" } else { "waiting" })
-        } else { format!("watching {} | idle", self.root.display()) };
+            format!("{} | {} lines | {} changes | tab {}/{} | last edit {} | {}{}", rel, tab.content.lines().count(), changes, self.tabs.active + 1, self.tabs.len(), ts.format("%H:%M:%S"), if self.last_change.is_some() { "idle" } else { "waiting" }, if copied { " | copied" } else { "" })
+        } else { format!("watching {} | idle{}", self.root.display(), if copied { " | copied" } else { "" }) };
         f.render_widget(Paragraph::new(text), area);
     }
 }
@@ -326,6 +385,111 @@ fn slice_chars(text: &str, start: usize, end: usize) -> String {
 }
 
 fn selection_style() -> Style { Style::default().bg(Color::Rgb(62, 84, 122)) }
+
+impl App {
+    fn copy_selection_to_clipboard(&mut self) {
+        let Some(tab) = self.tabs.current() else { return; };
+        let Some(selection) = tab.selection else { return; };
+        let Some(text) = selected_text(&tab.diff, selection) else { return; };
+        if self.write_clipboard(&text).is_ok() {
+            if let Some(tab) = self.tabs.current_mut() {
+                tab.selection = None;
+            }
+            self.copy_notice_until = Some(Instant::now() + Duration::from_millis(900));
+        }
+    }
+
+    fn write_clipboard(&mut self, text: &str) -> Result<()> {
+        if let Ok(mut child) = Command::new("wl-copy").stdin(Stdio::piped()).spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(text.as_bytes())?;
+            }
+            self.clipboard_process = Some(child);
+            self.clipboard = None;
+            return Ok(());
+        }
+
+        for (cmd, args) in [
+            ("xclip", vec!["-selection", "clipboard"]),
+            ("xsel", vec!["--clipboard", "--input"]),
+            ("pbcopy", vec![]),
+        ] {
+            let mut child = match Command::new(cmd).args(&args).stdin(Stdio::piped()).spawn() {
+                Ok(child) => child,
+                Err(_) => continue,
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(text.as_bytes())?;
+            }
+            let status = child.wait()?;
+            if status.success() {
+                self.clipboard_process = None;
+                self.clipboard = None;
+                return Ok(());
+            }
+        }
+
+        if let Some(clipboard) = &mut self.clipboard {
+            if clipboard.set_text(text.to_string()).is_ok() {
+                self.clipboard_process = None;
+                return Ok(());
+            }
+        }
+
+        if let Ok(mut clipboard) = Clipboard::new() {
+            clipboard.set_text(text.to_string())?;
+            self.clipboard = Some(clipboard);
+            self.clipboard_process = None;
+            return Ok(());
+        }
+
+        bail!("no clipboard backend succeeded")
+    }
+}
+
+fn selected_text(lines: &[crate::diff::DiffLine], selection: Selection) -> Option<String> {
+    let (start, end) = if selection.anchor <= selection.focus { (selection.anchor, selection.focus) } else { (selection.focus, selection.anchor) };
+    let mut out = String::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if idx < start.line || idx > end.line { continue; }
+        let chars: Vec<char> = line.text.chars().collect();
+        let line_start = if idx == start.line { start.column.min(chars.len()) } else { 0 };
+        let line_end = if idx == end.line { end.column.min(chars.len()) } else { chars.len() };
+        if line_start < line_end {
+            out.push_str(&chars[line_start..line_end].iter().collect::<String>());
+        }
+        if idx != end.line { out.push('\n'); }
+    }
+    Some(out)
+}
+
+fn latest_snapshot_change_line(old: &str, new: &str) -> Option<usize> {
+    let diff = TextDiff::from_lines(old, new);
+    for op in diff.ops().iter().rev() {
+        match op.tag() {
+            similar::DiffTag::Insert | similar::DiffTag::Replace => {
+                if op.new_range().len() > 0 {
+                    return Some(op.new_range().end.saturating_sub(1));
+                }
+            }
+            similar::DiffTag::Delete => {
+                return Some(op.new_range().start.saturating_sub(1));
+            }
+            similar::DiffTag::Equal => {}
+        }
+    }
+    None
+}
+
+fn parse_hunk_range(range: &str, sign: char) -> Option<(usize, usize)> {
+    let range = range.trim();
+    let range = range.strip_prefix(sign)?;
+    let (start, count) = match range.split_once(',') {
+        Some((start, count)) => (start.parse().ok()?, count.parse().ok()?),
+        None => (range.parse().ok()?, 1usize),
+    };
+    Some((start, count))
+}
 
 #[cfg(test)]
 mod tests {

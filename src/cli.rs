@@ -10,6 +10,7 @@ pub enum CliMode {
 }
 
 pub fn parse_cli_mode() -> Result<CliMode> {
+    // Parse either a watch root or a single remote control command.
     let mut args = std::env::args().skip(1);
     let mut root: Option<PathBuf> = None;
     let mut watch_root: Option<PathBuf> = None;
@@ -51,6 +52,7 @@ pub fn split_target_line(target: &str) -> (&str, Option<usize>) {
 }
 
 pub fn control_socket_path(root: &Path) -> PathBuf {
+    // Stable socket path derived from the watched root.
     let mut hasher = DefaultHasher::new();
     root.hash(&mut hasher);
     std::env::temp_dir().join(format!("piv-{:016x}.sock", hasher.finish()))
