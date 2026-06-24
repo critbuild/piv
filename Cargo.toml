@@ -1,0 +1,22 @@
+[package]
+name = "piv"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossterm = "0.28"
+ignore = "0.4"
+notify = "8.0"
+ratatui = "0.29"
+similar = "2.7"
+tree-sitter = "0.25"
+tree-sitter-highlight = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+walkdir = "2.5"
+
+[dev-dependencies]
+tempfile = "3.14"
