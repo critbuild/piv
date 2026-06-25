@@ -41,6 +41,7 @@ pub struct Tab {
     pub viewport_cache: Option<ViewportCache>,
     pub first_change: Option<usize>,
     pub focus_line: Option<usize>,
+    pub center_diff: Option<usize>,
     pub scroll: usize,
     pub auto_center: bool,
     pub selection: Option<Selection>,

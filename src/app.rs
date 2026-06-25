@@ -17,6 +17,7 @@ const MOUSE_SCROLL_LINES: usize = 5;
 const FALLBACK_SCAN_INTERVAL: Duration = Duration::from_millis(750);
 const FALLBACK_SCAN_IDLE_DELAY: Duration = Duration::from_millis(1200);
 const HIGHLIGHT_FADE_DURATION: Duration = Duration::from_secs(10);
+const AUTO_FOCUS_TOP_PADDING: usize = 2;
 const ASSUMED_EDITOR_BG: (u8, u8, u8) = (0x17, 0x23, 0x27);
 const AI_HIGHLIGHT_BG: (u8, u8, u8) = (78, 72, 110);
 
@@ -189,7 +190,7 @@ impl App {
         let first_change = diff.iter().position(|l| l.kind != LineKind::Unchanged);
         self.snapshots.entry(path.clone()).or_insert_with(|| content.clone());
         let focus_line = line.and_then(|line| row_index_for_new_line(&diff, line.saturating_sub(1))).or(first_change);
-        let tab = Tab { path, content, highlighted_lines, diff, prepared_rows, viewport_cache: None, first_change, focus_line, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        let tab = Tab { path, content, highlighted_lines, diff, prepared_rows, viewport_cache: None, first_change, focus_line, center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
         self.last_change = Some(SystemTime::now());
         self.tabs.add_or_bring_to_front(tab);
         Ok(())
@@ -251,7 +252,7 @@ impl App {
             .or_else(|| diff.iter().rposition(|l| l.kind != LineKind::Unchanged));
         self.snapshots.insert(path.clone(), content.clone());
         self.seen_mtimes.insert(path.clone(), at);
-        let tab = Tab { path, content, highlighted_lines, diff, prepared_rows, viewport_cache: None, first_change, focus_line, scroll: 0, auto_center: true, selection: None, last_edit: at };
+        let tab = Tab { path, content, highlighted_lines, diff, prepared_rows, viewport_cache: None, first_change, focus_line, center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: at };
         self.last_change = Some(at);
         self.tabs.add_or_bring_to_front(tab);
         Ok(())
@@ -289,6 +290,8 @@ impl App {
             (KeyCode::PageDown, _) => self.scroll_down(20),
             (KeyCode::Home, _) => self.set_scroll(0),
             (KeyCode::End, _) => if let Some(t) = self.tabs.current() { self.set_scroll(t.diff.len().saturating_sub(1)); },
+            (KeyCode::Char('['), _) => self.jump_to_diff(false),
+            (KeyCode::Char(']'), _) => self.jump_to_diff(true),
             (KeyCode::Char('c'), _) => if let Some(t) = self.tabs.current_mut() { t.auto_center = true; },
             _ => {}
         }
@@ -349,6 +352,22 @@ impl App {
     fn scroll_up(&mut self, n: usize) { if let Some(t) = self.tabs.current_mut() { t.scroll = t.scroll.saturating_sub(n); t.auto_center = false; } }
     fn scroll_down(&mut self, n: usize) { if let Some(t) = self.tabs.current_mut() { t.scroll = (t.scroll + n).min(t.diff.len().saturating_sub(1)); t.auto_center = false; } }
 
+    fn jump_to_diff(&mut self, forward: bool) {
+        let height = self.code_area.height.saturating_sub(2) as usize;
+        let target = self.tabs.current().and_then(|tab| {
+            let current = visible_diff_center(&tab.diff, tab.scroll, height).or(tab.center_diff);
+            next_diff_center(&tab.diff, current, forward)
+        });
+        if let Some(target) = target {
+            if let Some(tab) = self.tabs.current_mut() {
+                tab.center_diff = Some(target);
+                tab.focus_line = Some(target);
+                tab.auto_center = true;
+                tab.selection = None;
+            }
+        }
+    }
+
     fn render(&mut self, f: &mut Frame) {
         if self.remote_highlight.as_ref().is_some_and(|(_, _, _, at)| at.elapsed() >= HIGHLIGHT_FADE_DURATION) {
             self.remote_highlight = None;
@@ -388,6 +407,9 @@ impl App {
             return;
         };
         center_tab(tab, render_height);
+        if let Some(center) = visible_diff_center(&tab.diff, tab.scroll, render_height) {
+            tab.center_diff = Some(center);
+        }
 
         let height = area.height.saturating_sub(2) as usize;
         let highlight_style = self.remote_highlight.as_ref().and_then(|(_, _, _, at)| highlight_line_style(*at));
@@ -441,7 +463,48 @@ impl App {
 
 fn center_tab(tab: &mut Tab, height: usize) {
     if tab.auto_center {
-        if let Some(line) = tab.focus_line.or(tab.first_change) { tab.scroll = line.saturating_sub(height / 2); }
+        if let Some(line) = tab.focus_line.or(tab.first_change) {
+            tab.scroll = line.saturating_sub(AUTO_FOCUS_TOP_PADDING.min(height.saturating_sub(1)));
+        }
+    }
+}
+
+fn diff_hunks(diff: &[crate::diff::DiffLine]) -> Vec<(usize, usize)> {
+    let mut hunks = Vec::new();
+    let mut start = None;
+    for (idx, line) in diff.iter().enumerate() {
+        if line.kind != LineKind::Unchanged {
+            start.get_or_insert(idx);
+        } else if let Some(hunk_start) = start.take() {
+            hunks.push((hunk_start, idx - 1));
+        }
+    }
+    if let Some(hunk_start) = start {
+        hunks.push((hunk_start, diff.len().saturating_sub(1)));
+    }
+    hunks
+}
+
+fn hunk_anchor(start: usize, _end: usize) -> usize { start }
+
+fn visible_diff_center(diff: &[crate::diff::DiffLine], scroll: usize, height: usize) -> Option<usize> {
+    if height == 0 { return None; }
+    let viewport_end = scroll + height.saturating_sub(1);
+    let viewport_target = scroll + AUTO_FOCUS_TOP_PADDING.min(height.saturating_sub(1));
+    diff_hunks(diff)
+        .into_iter()
+        .filter(|(start, end)| *start <= viewport_end && *end >= scroll)
+        .map(|(start, end)| hunk_anchor(start, end))
+        .min_by_key(|anchor| anchor.abs_diff(viewport_target))
+}
+
+fn next_diff_center(diff: &[crate::diff::DiffLine], current: Option<usize>, forward: bool) -> Option<usize> {
+    let anchors = diff_hunks(diff).into_iter().map(|(start, end)| hunk_anchor(start, end)).collect::<Vec<_>>();
+    match (current, forward) {
+        (Some(current), true) => anchors.into_iter().find(|anchor| *anchor > current),
+        (Some(current), false) => anchors.into_iter().rev().find(|anchor| *anchor < current),
+        (None, true) => anchors.into_iter().next(),
+        (None, false) => anchors.into_iter().last(),
     }
 }
 
@@ -711,9 +774,55 @@ mod tests {
     }
 
     #[test]
+    fn visible_diff_center_tracks_hunk_near_top_of_screen() {
+        let diff = vec![
+            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(1), new_line_no: Some(1), text: "a".into() },
+            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(2), text: "b".into() },
+            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(3), text: "c".into() },
+            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(4), new_line_no: Some(4), text: "d".into() },
+            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(5), new_line_no: Some(5), text: "e".into() },
+            crate::diff::DiffLine { kind: LineKind::Removed, old_line_no: Some(6), new_line_no: None, text: "f".into() },
+            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(6), text: "F".into() },
+            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(7), new_line_no: Some(7), text: "g".into() },
+            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(8), text: "h".into() },
+        ];
+        assert_eq!(visible_diff_center(&diff, 0, 4), Some(1));
+        assert_eq!(visible_diff_center(&diff, 4, 3), Some(5));
+        assert_eq!(visible_diff_center(&diff, 6, 3), Some(8));
+    }
+
+    #[test]
+    fn next_diff_center_moves_between_hunk_starts() {
+        let diff = vec![
+            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(1), new_line_no: Some(1), text: "a".into() },
+            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(2), text: "b".into() },
+            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(3), text: "c".into() },
+            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(4), new_line_no: Some(4), text: "d".into() },
+            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(5), new_line_no: Some(5), text: "e".into() },
+            crate::diff::DiffLine { kind: LineKind::Removed, old_line_no: Some(6), new_line_no: None, text: "f".into() },
+            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(6), text: "F".into() },
+            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(7), new_line_no: Some(7), text: "g".into() },
+            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(8), text: "h".into() },
+        ];
+        assert_eq!(next_diff_center(&diff, None, true), Some(1));
+        assert_eq!(next_diff_center(&diff, Some(1), true), Some(5));
+        assert_eq!(next_diff_center(&diff, Some(5), true), Some(8));
+        assert_eq!(next_diff_center(&diff, Some(8), true), None);
+        assert_eq!(next_diff_center(&diff, Some(8), false), Some(5));
+        assert_eq!(next_diff_center(&diff, Some(5), false), Some(1));
+    }
+
+    #[test]
+    fn center_tab_places_focus_near_top() {
+        let mut tab = Tab { path: PathBuf::from("a"), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: Some(20), center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        center_tab(&mut tab, 20);
+        assert_eq!(tab.scroll, 18);
+    }
+
+    #[test]
     fn tab_manager_promotes_existing_and_evicts_lru() {
         let mut tm = TabManager::new(2);
-        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: None, center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
         tm.add_or_bring_to_front(mk("a"));
         tm.add_or_bring_to_front(mk("b"));
         tm.add_or_bring_to_front(mk("a"));
@@ -726,7 +835,7 @@ mod tests {
     #[test]
     fn tab_manager_removes_path_and_adjusts_active() {
         let mut tm = TabManager::new(3);
-        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: None, center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
         tm.add_or_bring_to_front(mk("a"));
         tm.add_or_bring_to_front(mk("b"));
         tm.add_or_bring_to_front(mk("c"));
@@ -740,7 +849,7 @@ mod tests {
     #[test]
     fn tab_manager_maps_click_column_to_tab() {
         let mut tm = TabManager::new(3);
-        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: None, center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
         tm.add_or_bring_to_front(mk("alpha.rs"));
         tm.add_or_bring_to_front(mk("beta.ts"));
         assert_eq!(tm.tab_hit_at_column(2), Some(TabHit::Select(0)));

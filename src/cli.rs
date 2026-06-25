@@ -47,6 +47,11 @@ pub fn parse_open_command(target: &str) -> Result<ControlCommand> {
 }
 
 pub fn parse_highlight_target(target: &str) -> Result<ControlCommand> {
+    let (path, start_line, end_line) = parse_highlight_range(target)?;
+    Ok(ControlCommand::Highlight { path, start_line, end_line })
+}
+
+fn parse_highlight_range(target: &str) -> Result<(PathBuf, usize, usize)> {
     let (path, range) = target.rsplit_once(':').context("highlight target must include a line or range, like path/to/file.rs:120 or path/to/file.rs:120-140")?;
     let (start_line, end_line) = match range.split_once('-') {
         Some((start, end)) => (
@@ -58,7 +63,7 @@ pub fn parse_highlight_target(target: &str) -> Result<ControlCommand> {
             (line, line)
         }
     };
-    Ok(ControlCommand::Highlight { path: PathBuf::from(path), start_line, end_line })
+    Ok((PathBuf::from(path), start_line, end_line))
 }
 
 // Parse a remote-control target, optionally with a trailing :line.
@@ -92,4 +97,5 @@ mod tests {
             _ => panic!("expected highlight command"),
         }
     }
+
 }
