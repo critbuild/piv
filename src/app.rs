@@ -7,7 +7,7 @@ use ratatui::{backend::CrosstermBackend, layout::{Constraint, Direction, Layout,
 use similar::TextDiff;
 use walkdir::WalkDir;
 
-use crate::{control::{ControlCommand, ControlServer}, diff::{DiffEngine, LineKind}, highlight::{default_code_style, Highlighter}, model::{Selection, Tab, TabManager, TextPoint}, watcher::{FileWatcher, IgnorePolicy, WatchEvent}};
+use crate::{control::{ControlCommand, ControlServer}, diff::{DiffEngine, LineKind}, highlight::{default_code_style, Highlighter}, model::{PreparedRow, Selection, Tab, TabManager, TextPoint}, watcher::{FileWatcher, IgnorePolicy, WatchEvent}};
 
 use arboard::Clipboard;
 
@@ -15,7 +15,10 @@ const MAX_TABS: usize = 10;
 const BATCH_WINDOW: Duration = Duration::from_millis(120);
 const MOUSE_SCROLL_LINES: usize = 5;
 const FALLBACK_SCAN_INTERVAL: Duration = Duration::from_millis(750);
+const FALLBACK_SCAN_IDLE_DELAY: Duration = Duration::from_millis(1200);
 const HIGHLIGHT_FADE_DURATION: Duration = Duration::from_secs(10);
+const ASSUMED_EDITOR_BG: (u8, u8, u8) = (0x17, 0x23, 0x27);
+const AI_HIGHLIGHT_BG: (u8, u8, u8) = (78, 72, 110);
 
 pub struct App {
     root: PathBuf,
@@ -34,6 +37,7 @@ pub struct App {
     tab_area: Rect,
     code_area: Rect,
     mouse_selecting: bool,
+    last_input_at: Instant,
     last_change: Option<SystemTime>,
     copy_notice_until: Option<Instant>,
 }
@@ -61,6 +65,7 @@ impl App {
             tab_area: Rect::default(),
             code_area: Rect::default(),
             mouse_selecting: false,
+            last_input_at: Instant::now(),
             last_change: None,
             copy_notice_until: None,
         };
@@ -92,31 +97,46 @@ impl App {
     }
 
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+        let mut should_draw = true;
         loop {
-            terminal.draw(|f| self.render(f))?;
-            self.drain_file_changes()?;
-            self.scan_for_missed_changes()?;
-            self.drain_control_commands()?;
-            if event::poll(Duration::from_millis(50))? {
+            if should_draw {
+                terminal.draw(|f| self.render(f))?;
+                should_draw = false;
+            }
+
+            if self.drain_file_changes()? { should_draw = true; }
+            if self.scan_for_missed_changes()? { should_draw = true; }
+            if self.drain_control_commands()? { should_draw = true; }
+
+            let timeout = if self.remote_highlight.is_some() { Duration::from_millis(33) } else { Duration::from_millis(250) };
+            if event::poll(timeout)? {
+                should_draw = true;
+                self.last_input_at = Instant::now();
                 match event::read()? {
                     TermEvent::Key(key) if self.handle_key(key) => break,
                     TermEvent::Mouse(mouse) => self.handle_mouse(mouse),
                     TermEvent::Resize(_, _) => {}
                     _ => {}
                 }
+            } else if self.remote_highlight.is_some() {
+                should_draw = true;
             }
         }
         Ok(())
     }
 
-    fn drain_control_commands(&mut self) -> Result<()> {
+    fn drain_control_commands(&mut self) -> Result<bool> {
+        let mut changed = false;
         loop {
             match self.command_rx.try_recv() {
-                Ok(command) => self.handle_control_command(command)?,
+                Ok(command) => {
+                    self.handle_control_command(command)?;
+                    changed = true;
+                }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
-        Ok(())
+        Ok(changed)
     }
 
     fn handle_control_command(&mut self, command: ControlCommand) -> Result<()> {
@@ -131,8 +151,8 @@ impl App {
         Ok(())
     }
 
-    fn drain_file_changes(&mut self) -> Result<()> {
-        let first = match self.rx.try_recv() { Ok(c) => c, Err(_) => return Ok(()) };
+    fn drain_file_changes(&mut self) -> Result<bool> {
+        let first = match self.rx.try_recv() { Ok(c) => c, Err(_) => return Ok(false) };
         let mut changed: HashMap<PathBuf, SystemTime> = HashMap::new();
         let mut removed: Vec<(PathBuf, SystemTime)> = Vec::new();
         match first {
@@ -149,7 +169,7 @@ impl App {
         }
         for (path, at) in removed { self.remove_file(&path, at); }
         for (path, at) in changed { self.load_change(path, at)?; }
-        Ok(())
+        Ok(true)
     }
 
     fn remove_file(&mut self, path: &Path, at: SystemTime) {
@@ -165,10 +185,11 @@ impl App {
         let content = fs::read_to_string(&path).unwrap_or_else(|_| "<binary or unreadable file>".into());
         let diff = self.diff_for_path(&path, &content);
         let highlighted_lines = self.highlighter.highlight_lines(&path, &content);
+        let prepared_rows = prepare_rows(&diff, &highlighted_lines);
         let first_change = diff.iter().position(|l| l.kind != LineKind::Unchanged);
         self.snapshots.entry(path.clone()).or_insert_with(|| content.clone());
         let focus_line = line.and_then(|line| row_index_for_new_line(&diff, line.saturating_sub(1))).or(first_change);
-        let tab = Tab { path, content, highlighted_lines, diff, first_change, focus_line, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        let tab = Tab { path, content, highlighted_lines, diff, prepared_rows, viewport_cache: None, first_change, focus_line, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
         self.last_change = Some(SystemTime::now());
         self.tabs.add_or_bring_to_front(tab);
         Ok(())
@@ -190,8 +211,9 @@ impl App {
         }
     }
 
-    fn scan_for_missed_changes(&mut self) -> Result<()> {
-        if self.last_fallback_scan.elapsed() < FALLBACK_SCAN_INTERVAL { return Ok(()); }
+    fn scan_for_missed_changes(&mut self) -> Result<bool> {
+        if self.last_fallback_scan.elapsed() < FALLBACK_SCAN_INTERVAL { return Ok(false); }
+        if self.last_input_at.elapsed() < FALLBACK_SCAN_IDLE_DELAY { return Ok(false); }
         self.last_fallback_scan = Instant::now();
 
         let policy = IgnorePolicy::new(&self.root);
@@ -211,9 +233,10 @@ impl App {
         let removed = self.seen_mtimes.keys().filter(|path| !current.contains_key(*path)).cloned().collect::<Vec<_>>();
         self.seen_mtimes = current;
 
+        let had_changes = !removed.is_empty() || !changed.is_empty();
         for path in removed { self.remove_file(&path, SystemTime::now()); }
         for (path, at) in changed { self.load_change(path, at)?; }
-        Ok(())
+        Ok(had_changes)
     }
 
     fn load_change(&mut self, path: PathBuf, at: SystemTime) -> Result<()> {
@@ -221,13 +244,14 @@ impl App {
         let old_snapshot = self.snapshots.get(&path).cloned().unwrap_or_else(|| content.clone());
         let diff = self.diff_for_path(&path, &content);
         let highlighted_lines = self.highlighter.highlight_lines(&path, &content);
+        let prepared_rows = prepare_rows(&diff, &highlighted_lines);
         let first_change = diff.iter().position(|l| l.kind != LineKind::Unchanged);
         let focus_line = latest_snapshot_change_line(&old_snapshot, &content)
             .and_then(|line| row_index_for_new_line(&diff, line))
             .or_else(|| diff.iter().rposition(|l| l.kind != LineKind::Unchanged));
         self.snapshots.insert(path.clone(), content.clone());
         self.seen_mtimes.insert(path.clone(), at);
-        let tab = Tab { path, content, highlighted_lines, diff, first_change, focus_line, scroll: 0, auto_center: true, selection: None, last_edit: at };
+        let tab = Tab { path, content, highlighted_lines, diff, prepared_rows, viewport_cache: None, first_change, focus_line, scroll: 0, auto_center: true, selection: None, last_edit: at };
         self.last_change = Some(at);
         self.tabs.add_or_bring_to_front(tab);
         Ok(())
@@ -344,38 +368,47 @@ impl App {
 
     fn render_code(&mut self, f: &mut Frame, area: Rect) {
         let render_height = area.height.saturating_sub(2) as usize;
-        if let Some(t) = self.tabs.current_mut() { center_tab(t, render_height); }
-        let Some(tab) = self.tabs.current() else {
+        let Some(tab) = self.tabs.current_mut() else {
             f.render_widget(Paragraph::new("No source files found yet. Waiting for changes...").block(Block::default().borders(Borders::ALL)), area);
             return;
         };
+        center_tab(tab, render_height);
+
         let height = area.height.saturating_sub(2) as usize;
         let highlight_style = self.remote_highlight.as_ref().and_then(|(_, _, _, at)| highlight_line_style(*at));
-        let lines = tab.diff.iter().enumerate().skip(tab.scroll).take(height).map(|(idx, dl)| {
-            let line_highlighted = self.remote_highlight.as_ref().is_some_and(|(path, start_line, end_line, _)| {
-                path == &tab.path
-                    && dl.new_line_no.is_some_and(|line| ((start_line + 1)..=(end_line + 1)).contains(&line))
-            });
-            let mark = match dl.kind { LineKind::Added => "+", LineKind::Removed => "-", LineKind::Unchanged => " " };
-            let mark_style = match dl.kind { LineKind::Added => Style::default().fg(Color::Green), LineKind::Removed => Style::default().fg(Color::Red), LineKind::Unchanged => Style::default().fg(Color::DarkGray) };
-            let line_no = dl.new_line_no.or(dl.old_line_no).unwrap_or(idx + 1);
-            let line_no_style = match dl.kind { LineKind::Removed => Style::default().fg(Color::DarkGray), _ => Style::default().fg(Color::DarkGray) };
-            let mut spans = vec![Span::styled(format!("{:>4} ", line_no), line_no_style), Span::styled(mark, mark_style), Span::raw(" ")];
-            let base = dl.new_line_no
-                .and_then(|line| tab.highlighted_lines.get(line.saturating_sub(1)).cloned())
-                .unwrap_or_else(|| vec![Span::styled(dl.text.clone(), default_code_style())]);
-            let mut code_spans = apply_selection(&base, selection_range_for_line(tab.selection, idx, &dl.text));
-            if dl.kind == LineKind::Removed {
-                code_spans = apply_style_range(&code_spans, leading_whitespace_chars(&dl.text), dl.text.chars().count(), removed_line_style());
-            }
-            if line_highlighted {
-                if let Some(style) = highlight_style {
-                    code_spans = apply_style_range(&code_spans, leading_whitespace_chars(&dl.text), dl.text.chars().count(), style);
+        let selection_active = tab.selection.is_some();
+        let static_only = !selection_active && highlight_style.is_none();
+        let lines = if static_only {
+            cached_static_viewport_lines(tab, height)
+        } else {
+            tab.diff.iter().zip(tab.prepared_rows.iter()).enumerate().skip(tab.scroll).take(height).map(|(idx, (dl, row))| {
+                let line_highlighted = self.remote_highlight.as_ref().is_some_and(|(path, start_line, end_line, _)| {
+                    path == &tab.path
+                        && row.new_line_no.is_some_and(|line| ((start_line + 1)..=(end_line + 1)).contains(&line))
+                });
+                if !selection_active && !line_highlighted {
+                    return row.static_line.clone();
                 }
-            }
-            spans.extend(code_spans);
-            Line::from(spans)
-        }).collect::<Vec<_>>();
+                let mark = match row.kind { LineKind::Added => "+", LineKind::Removed => "-", LineKind::Unchanged => " " };
+                let mark_style = match row.kind { LineKind::Added => Style::default().fg(Color::Green), LineKind::Removed => Style::default().fg(Color::Red), LineKind::Unchanged => Style::default().fg(Color::DarkGray) };
+                let mut spans = vec![Span::styled(format!("{:>4} ", row.line_no), Style::default().fg(Color::DarkGray)), Span::styled(mark, mark_style), Span::raw(" ")];
+                let mut code_spans = if selection_active {
+                    apply_selection(&row.base_spans, selection_range_for_line(tab.selection, idx, &dl.text))
+                } else {
+                    row.base_spans.clone()
+                };
+                if row.kind == LineKind::Removed {
+                    code_spans = apply_style_range(&code_spans, row.leading_ws, row.text_len, removed_line_style());
+                }
+                if line_highlighted {
+                    if let Some(style) = highlight_style {
+                        code_spans = apply_style_range(&code_spans, row.leading_ws, row.text_len, style);
+                    }
+                }
+                spans.extend(code_spans);
+                Line::from(spans)
+            }).collect::<Vec<_>>()
+        };
         f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL)), area);
     }
 
@@ -402,6 +435,66 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
 }
 
 fn code_prefix_width() -> usize { 7 }
+
+fn cached_static_viewport_lines(tab: &mut Tab, height: usize) -> Vec<Line<'static>> {
+    if let Some(cache) = &mut tab.viewport_cache {
+        if cache.height == height {
+            if cache.scroll == tab.scroll {
+                return cache.lines.clone();
+            }
+            if cache.scroll + 1 == tab.scroll {
+                if !cache.lines.is_empty() { cache.lines.remove(0); }
+                let next_idx = tab.scroll + height.saturating_sub(1);
+                if let Some(row) = tab.prepared_rows.get(next_idx) { cache.lines.push(row.static_line.clone()); }
+                cache.scroll = tab.scroll;
+                return cache.lines.clone();
+            }
+            if tab.scroll + 1 == cache.scroll {
+                let _ = cache.lines.pop();
+                if let Some(row) = tab.prepared_rows.get(tab.scroll) { cache.lines.insert(0, row.static_line.clone()); }
+                cache.scroll = tab.scroll;
+                return cache.lines.clone();
+            }
+        }
+    }
+
+    let lines = tab.prepared_rows.iter().skip(tab.scroll).take(height).map(|row| row.static_line.clone()).collect::<Vec<_>>();
+    tab.viewport_cache = Some(crate::model::ViewportCache { scroll: tab.scroll, height, lines: lines.clone() });
+    lines
+}
+
+fn prepare_rows(diff: &[crate::diff::DiffLine], highlighted_lines: &[Vec<Span<'static>>]) -> Vec<PreparedRow> {
+    diff.iter().enumerate().map(|(idx, dl)| {
+        let kind = dl.kind.clone();
+        let line_no = dl.new_line_no.or(dl.old_line_no).unwrap_or(idx + 1);
+        let leading_ws = leading_whitespace_chars(&dl.text);
+        let text_len = dl.text.chars().count();
+        let base_spans = dl.new_line_no
+            .and_then(|line| highlighted_lines.get(line.saturating_sub(1)).cloned())
+            .unwrap_or_else(|| vec![Span::styled(dl.text.clone(), default_code_style())]);
+        let mut static_code_spans = base_spans.clone();
+        if kind == LineKind::Removed {
+            static_code_spans = apply_style_range(&static_code_spans, leading_ws, text_len, removed_line_style());
+        }
+        let mark = match kind { LineKind::Added => "+", LineKind::Removed => "-", LineKind::Unchanged => " " };
+        let mark_style = match kind { LineKind::Added => Style::default().fg(Color::Green), LineKind::Removed => Style::default().fg(Color::Red), LineKind::Unchanged => Style::default().fg(Color::DarkGray) };
+        let mut spans = vec![
+            Span::styled(format!("{:>4} ", line_no), Style::default().fg(Color::DarkGray)),
+            Span::styled(mark, mark_style),
+            Span::raw(" "),
+        ];
+        spans.extend(static_code_spans);
+        PreparedRow {
+            kind,
+            line_no,
+            new_line_no: dl.new_line_no,
+            leading_ws,
+            text_len,
+            base_spans,
+            static_line: Line::from(spans),
+        }
+    }).collect()
+}
 
 fn selection_range_for_line(selection: Option<Selection>, line: usize, text: &str) -> Option<(usize, usize)> {
     let selection = selection?;
@@ -472,8 +565,12 @@ fn highlight_line_style(started_at: Instant) -> Option<Style> {
     let elapsed = started_at.elapsed();
     if elapsed >= HIGHLIGHT_FADE_DURATION { return None; }
     let remain = 1.0 - (elapsed.as_secs_f32() / HIGHLIGHT_FADE_DURATION.as_secs_f32());
-    let scale = |n: u8| ((n as f32) * remain).round().clamp(0.0, 255.0) as u8;
-    Some(Style::default().bg(Color::Rgb(scale(78), scale(72), scale(110))))
+    let blend = |from: u8, to: u8| ((to as f32) + ((from as f32) - (to as f32)) * remain).round().clamp(0.0, 255.0) as u8;
+    Some(Style::default().bg(Color::Rgb(
+        blend(AI_HIGHLIGHT_BG.0, ASSUMED_EDITOR_BG.0),
+        blend(AI_HIGHLIGHT_BG.1, ASSUMED_EDITOR_BG.1),
+        blend(AI_HIGHLIGHT_BG.2, ASSUMED_EDITOR_BG.2),
+    )))
 }
 fn removed_line_style() -> Style { Style::default().bg(Color::Rgb(92, 48, 48)) }
 
@@ -601,7 +698,7 @@ mod tests {
     #[test]
     fn tab_manager_promotes_existing_and_evicts_lru() {
         let mut tm = TabManager::new(2);
-        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], first_change: None, focus_line: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
         tm.add_or_bring_to_front(mk("a"));
         tm.add_or_bring_to_front(mk("b"));
         tm.add_or_bring_to_front(mk("a"));
@@ -614,7 +711,7 @@ mod tests {
     #[test]
     fn tab_manager_removes_path_and_adjusts_active() {
         let mut tm = TabManager::new(3);
-        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], first_change: None, focus_line: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
         tm.add_or_bring_to_front(mk("a"));
         tm.add_or_bring_to_front(mk("b"));
         tm.add_or_bring_to_front(mk("c"));
@@ -628,7 +725,7 @@ mod tests {
     #[test]
     fn tab_manager_maps_click_column_to_tab() {
         let mut tm = TabManager::new(3);
-        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], first_change: None, focus_line: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
         tm.add_or_bring_to_front(mk("alpha.rs"));
         tm.add_or_bring_to_front(mk("beta.ts"));
         assert_eq!(tm.tab_at_column(1), Some(0));

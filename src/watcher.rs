@@ -78,7 +78,24 @@ impl IgnorePolicy {
         let rel = path.strip_prefix(&self.root).unwrap_or(path);
         if rel.components().any(|c| {
             let s = c.as_os_str().to_string_lossy();
-            matches!(s.as_ref(), ".git" | "target" | "node_modules" | "__pycache__" | ".idea" | ".vscode")
+            matches!(
+                s.as_ref(),
+                ".git"
+                    | "target"
+                    | "node_modules"
+                    | "__pycache__"
+                    | ".idea"
+                    | ".vscode"
+                    | "cache"
+                    | ".cache"
+                    | ".pytest_cache"
+                    | ".mypy_cache"
+                    | ".ruff_cache"
+                    | "dist"
+                    | "build"
+                    | ".venv"
+                    | "venv"
+            )
         }) {
             return false;
         }
@@ -137,5 +154,25 @@ mod tests {
             }
         }
         panic!("expected changed event for atomic replace");
+    }
+
+    #[test]
+    fn ignore_policy_filters_common_cache_and_build_dirs() {
+        let root = PathBuf::from("/tmp/project");
+        let policy = IgnorePolicy::new(&root);
+        for rel in [
+            "cache/data.json",
+            ".cache/data.json",
+            ".pytest_cache/state",
+            ".mypy_cache/module.json",
+            ".ruff_cache/index",
+            "dist/app.js",
+            "build/output.bin",
+            ".venv/bin/python",
+            "venv/bin/python",
+        ] {
+            assert!(!policy.allows(&root.join(rel)), "expected {rel} to be ignored");
+        }
+        assert!(policy.allows(&root.join("src/main.py")));
     }
 }

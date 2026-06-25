@@ -5,6 +5,9 @@ use ratatui::{style::{Color, Modifier, Style}, text::Span};
 use tree_sitter::Language;
 use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, Highlighter as TreeSitterHighlighter};
 
+const MAX_HIGHLIGHT_BYTES: usize = 300_000;
+const MAX_HIGHLIGHT_LINES: usize = 4_000;
+
 const TREE_SITTER_HIGHLIGHTS: &[&str] = &[
     "attribute", "comment", "constant", "constant.builtin", "constructor", "embedded", "function", "function.builtin",
     "keyword", "module", "number", "operator", "property", "punctuation", "punctuation.bracket",
@@ -42,11 +45,15 @@ impl Highlighter {
                 LanguageConfig::new(&["tsx"], "tsx", tree_sitter_typescript::LANGUAGE_TSX.into(), tree_sitter_typescript::HIGHLIGHTS_QUERY, "", tree_sitter_typescript::LOCALS_QUERY)?,
                 LanguageConfig::new(&["js"], "javascript", tree_sitter_javascript::LANGUAGE.into(), tree_sitter_javascript::HIGHLIGHT_QUERY, tree_sitter_javascript::INJECTIONS_QUERY, tree_sitter_javascript::LOCALS_QUERY)?,
                 LanguageConfig::new(&["jsx"], "jsx", tree_sitter_javascript::LANGUAGE.into(), tree_sitter_javascript::JSX_HIGHLIGHT_QUERY, tree_sitter_javascript::INJECTIONS_QUERY, tree_sitter_javascript::LOCALS_QUERY)?,
+                LanguageConfig::new(&["py"], "python", tree_sitter_python::LANGUAGE.into(), tree_sitter_python::HIGHLIGHTS_QUERY, "", "")?,
             ],
         })
     }
 
     pub fn highlight_lines(&self, path: &Path, source: &str) -> Vec<Vec<Span<'static>>> {
+        if source.len() > MAX_HIGHLIGHT_BYTES || source.lines().count() > MAX_HIGHLIGHT_LINES {
+            return plain_lines(source);
+        }
         let Some(language) = self.configs.iter().find(|config| config.matches(path)) else { return plain_lines(source); };
         let mut highlighter = TreeSitterHighlighter::new();
         let Ok(events) = highlighter.highlight(&language.config, source.as_bytes(), None, |_| None) else { return plain_lines(source); };

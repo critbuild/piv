@@ -1,8 +1,8 @@
 use std::{collections::VecDeque, path::{Path, PathBuf}, time::SystemTime};
 
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 
-use crate::diff::DiffLine;
+use crate::{diff::{DiffLine, LineKind}};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TextPoint {
@@ -16,11 +16,29 @@ pub struct Selection {
     pub focus: TextPoint,
 }
 
+pub struct PreparedRow {
+    pub kind: LineKind,
+    pub line_no: usize,
+    pub new_line_no: Option<usize>,
+    pub leading_ws: usize,
+    pub text_len: usize,
+    pub base_spans: Vec<Span<'static>>,
+    pub static_line: Line<'static>,
+}
+
+pub struct ViewportCache {
+    pub scroll: usize,
+    pub height: usize,
+    pub lines: Vec<Line<'static>>,
+}
+
 pub struct Tab {
     pub path: PathBuf,
     pub content: String,
     pub highlighted_lines: Vec<Vec<Span<'static>>>,
     pub diff: Vec<DiffLine>,
+    pub prepared_rows: Vec<PreparedRow>,
+    pub viewport_cache: Option<ViewportCache>,
     pub first_change: Option<usize>,
     pub focus_line: Option<usize>,
     pub scroll: usize,
