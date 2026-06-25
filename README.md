@@ -13,7 +13,7 @@ It watches a project directory for file changes, opens changed files in tabs, hi
 - mouse wheel scroll
 - clickable tabs
 - mouse text selection
-- remote open and jump commands
+- remote open, jump, and highlight commands
 
 ## Run
 
@@ -30,6 +30,8 @@ Restart `piv` after upgrading so the control socket is available.
 ```sh
 piv --open src/main.rs:120
 piv --open test.md
+piv --highlight src/main.rs:120
+piv --highlight-range src/control.rs:24-34
 piv --line 200
 piv --next-tab
 piv --prev-tab

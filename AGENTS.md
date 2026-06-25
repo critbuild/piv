@@ -9,6 +9,8 @@ If `piv` is running for this repo, prefer remote control over fake file edits wh
 ```sh
 piv --open src/main.rs:120
 piv --open path/to/file
+piv --highlight src/main.rs:120
+piv --highlight-range src/control.rs:24-34
 piv --line 200
 piv --next-tab
 piv --prev-tab
