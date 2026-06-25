@@ -47,6 +47,12 @@ pub struct Tab {
     pub last_edit: SystemTime,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabHit {
+    Select(usize),
+    Close(usize),
+}
+
 pub struct TabManager {
     pub tabs: VecDeque<Tab>,
     pub active: usize,
@@ -72,21 +78,39 @@ impl TabManager {
         if index < self.tabs.len() { self.active = index; }
     }
 
-    pub fn tab_at_column(&self, column: u16) -> Option<usize> {
+    pub fn tab_hit_at_column(&self, column: u16) -> Option<TabHit> {
         let mut x = 0u16;
         for (index, tab) in self.tabs.iter().enumerate() {
             let name = tab.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
-            let width = (name.chars().count() + 2) as u16;
-            if column >= x && column < x.saturating_add(width) { return Some(index); }
-            x = x.saturating_add(width);
+            let name_width = name.chars().count() as u16;
+            let divider_width = if index > 0 { 3 } else { 0 };
+            let total_width = divider_width + name_width + 3;
+            if column >= x && column < x.saturating_add(total_width) {
+                if divider_width > 0 && column < x + divider_width { return None; }
+                let content_x = x + divider_width;
+                let close_x = content_x + 1 + name_width + 1;
+                return Some(if column == close_x { TabHit::Close(index) } else { TabHit::Select(index) });
+            }
+            x = x.saturating_add(total_width);
         }
         None
     }
 
     pub fn remove(&mut self, path: &Path) {
         if let Some(pos) = self.tabs.iter().position(|t| t.path == path) {
-            self.tabs.remove(pos);
-            if self.active >= self.tabs.len() && !self.tabs.is_empty() { self.active = self.tabs.len() - 1; }
+            self.remove_at(pos);
+        }
+    }
+
+    pub fn remove_at(&mut self, index: usize) {
+        if index >= self.tabs.len() { return; }
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            self.active = 0;
+        } else if self.active > index {
+            self.active -= 1;
+        } else if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
         }
     }
 }

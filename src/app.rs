@@ -7,7 +7,7 @@ use ratatui::{backend::CrosstermBackend, layout::{Constraint, Direction, Layout,
 use similar::TextDiff;
 use walkdir::WalkDir;
 
-use crate::{control::{ControlCommand, ControlServer}, diff::{DiffEngine, LineKind}, highlight::{default_code_style, Highlighter}, model::{PreparedRow, Selection, Tab, TabManager, TextPoint}, watcher::{FileWatcher, IgnorePolicy, WatchEvent}};
+use crate::{control::{ControlCommand, ControlServer}, diff::{DiffEngine, LineKind}, highlight::{default_code_style, Highlighter}, model::{PreparedRow, Selection, Tab, TabHit, TabManager, TextPoint}, watcher::{FileWatcher, IgnorePolicy, WatchEvent}};
 
 use arboard::Clipboard;
 
@@ -301,7 +301,11 @@ impl App {
             MouseEventKind::ScrollDown => self.scroll_down(MOUSE_SCROLL_LINES),
             MouseEventKind::Down(MouseButton::Left) => {
                 if rect_contains(self.tab_area, mouse.column, mouse.row) {
-                    if let Some(index) = self.tabs.tab_at_column(mouse.column.saturating_sub(self.tab_area.x)) { self.tabs.select(index); }
+                    match self.tabs.tab_hit_at_column(mouse.column.saturating_sub(self.tab_area.x)) {
+                        Some(TabHit::Select(index)) => self.tabs.select(index),
+                        Some(TabHit::Close(index)) => self.tabs.remove_at(index),
+                        None => {}
+                    }
                     self.mouse_selecting = false;
                 } else if let Some(point) = self.mouse_point_to_text_point(mouse.column, mouse.row) {
                     if let Some(tab) = self.tabs.current_mut() {
@@ -358,11 +362,22 @@ impl App {
     }
 
     fn render_tabs(&self, f: &mut Frame, area: Rect) {
-        let spans = self.tabs.tabs.iter().enumerate().flat_map(|(i, t)| {
+        let divider_style = Style::default().fg(Color::DarkGray);
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(self.tabs.tabs.iter().enumerate().flat_map(|(i, t)| {
             let name = t.path.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string();
-            let style = if i == self.tabs.active { Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Gray) };
-            vec![Span::raw(" "), Span::styled(name, style), Span::raw(" ")]
-        }).collect::<Vec<_>>();
+            let active = i == self.tabs.active;
+            let accent_style = if active { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) } else { divider_style };
+            let label_style = if active { Style::default().fg(Color::White).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Gray) };
+            let close_style = if active { Style::default().fg(Color::Rgb(220, 80, 80)).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Rgb(180, 40, 40)) };
+            let mut parts = Vec::new();
+            if i > 0 { parts.push(Span::styled(" │ ", divider_style)); }
+            parts.push(Span::styled(if active { "▌" } else { " " }, accent_style));
+            parts.push(Span::styled(name, label_style));
+            parts.push(Span::raw(" "));
+            parts.push(Span::styled("×", close_style));
+            parts
+        }));
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
@@ -728,8 +743,9 @@ mod tests {
         let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
         tm.add_or_bring_to_front(mk("alpha.rs"));
         tm.add_or_bring_to_front(mk("beta.ts"));
-        assert_eq!(tm.tab_at_column(1), Some(0));
-        assert_eq!(tm.tab_at_column(11), Some(1));
+        assert_eq!(tm.tab_hit_at_column(1), Some(TabHit::Select(0)));
+        assert_eq!(tm.tab_hit_at_column(9), Some(TabHit::Close(0)));
+        assert_eq!(tm.tab_hit_at_column(14), Some(TabHit::Select(1)));
     }
 
     #[test]
