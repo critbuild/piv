@@ -743,9 +743,9 @@ mod tests {
         let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
         tm.add_or_bring_to_front(mk("alpha.rs"));
         tm.add_or_bring_to_front(mk("beta.ts"));
-        assert_eq!(tm.tab_hit_at_column(1), Some(TabHit::Select(0)));
-        assert_eq!(tm.tab_hit_at_column(9), Some(TabHit::Close(0)));
-        assert_eq!(tm.tab_hit_at_column(14), Some(TabHit::Select(1)));
+        assert_eq!(tm.tab_hit_at_column(2), Some(TabHit::Select(0)));
+        assert_eq!(tm.tab_hit_at_column(10), Some(TabHit::Close(0)));
+        assert_eq!(tm.tab_hit_at_column(15), Some(TabHit::Select(1)));
     }
 
     #[test]

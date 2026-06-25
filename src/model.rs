@@ -79,7 +79,7 @@ impl TabManager {
     }
 
     pub fn tab_hit_at_column(&self, column: u16) -> Option<TabHit> {
-        let mut x = 0u16;
+        let mut x = 1u16;
         for (index, tab) in self.tabs.iter().enumerate() {
             let name = tab.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
             let name_width = name.chars().count() as u16;
