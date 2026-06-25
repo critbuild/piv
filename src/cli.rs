@@ -20,6 +20,7 @@ pub fn parse_cli_mode() -> Result<CliMode> {
         match arg.as_str() {
             "--root" => root = Some(PathBuf::from(args.next().context("--root needs a path")?)),
             "--open" => command = Some(parse_open_command(&args.next().context("--open needs a target")?)?),
+            "--highlight" => command = Some(parse_highlight_command(&args.next().context("--highlight needs a target")?)?),
             "--line" => command = Some(ControlCommand::Line(args.next().context("--line needs a line number")?.parse().context("line must be a number")?)),
             "--next-tab" => command = Some(ControlCommand::TabNext),
             "--prev-tab" => command = Some(ControlCommand::TabPrev),
@@ -42,6 +43,12 @@ pub fn parse_cli_mode() -> Result<CliMode> {
 pub fn parse_open_command(target: &str) -> Result<ControlCommand> {
     let (path, line) = split_target_line(target);
     Ok(ControlCommand::Open { path: PathBuf::from(path), line })
+}
+
+pub fn parse_highlight_command(target: &str) -> Result<ControlCommand> {
+    let (path, line) = split_target_line(target);
+    let line = line.context("--highlight target must include a line, like path/to/file.rs:120")?;
+    Ok(ControlCommand::Highlight { path: PathBuf::from(path), line })
 }
 
 pub fn split_target_line(target: &str) -> (&str, Option<usize>) {

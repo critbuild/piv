@@ -14,6 +14,7 @@ use arboard::Clipboard;
 const MAX_TABS: usize = 10;
 const BATCH_WINDOW: Duration = Duration::from_millis(120);
 const MOUSE_SCROLL_LINES: usize = 5;
+const FALLBACK_SCAN_INTERVAL: Duration = Duration::from_millis(750);
 
 pub struct App {
     root: PathBuf,
@@ -23,9 +24,12 @@ pub struct App {
     _control_server: ControlServer,
     tabs: TabManager,
     snapshots: HashMap<PathBuf, String>,
+    seen_mtimes: HashMap<PathBuf, SystemTime>,
+    last_fallback_scan: Instant,
     highlighter: Highlighter,
     clipboard: Option<Clipboard>,
     clipboard_process: Option<Child>,
+    remote_highlight: Option<(PathBuf, usize)>,
     tab_area: Rect,
     code_area: Rect,
     mouse_selecting: bool,
@@ -47,15 +51,19 @@ impl App {
             _control_server: control_server,
             tabs: TabManager::new(MAX_TABS),
             snapshots: HashMap::new(),
+            seen_mtimes: HashMap::new(),
+            last_fallback_scan: Instant::now(),
             highlighter: Highlighter::new()?,
             clipboard: Clipboard::new().ok(),
             clipboard_process: None,
+            remote_highlight: None,
             tab_area: Rect::default(),
             code_area: Rect::default(),
             mouse_selecting: false,
             last_change: None,
             copy_notice_until: None,
         };
+        app.seed_seen_mtimes()?;
         app.open_initial_file()?;
         Ok(app)
     }
@@ -70,10 +78,23 @@ impl App {
         Ok(())
     }
 
+    fn seed_seen_mtimes(&mut self) -> Result<()> {
+        let policy = IgnorePolicy::new(&self.root);
+        self.seen_mtimes = WalkDir::new(&self.root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file() && policy.allows(e.path()))
+            .filter_map(|e| e.metadata().ok().and_then(|m| m.modified().ok().map(|t| (e.path().to_path_buf(), t))))
+            .collect();
+        self.last_fallback_scan = Instant::now();
+        Ok(())
+    }
+
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
         loop {
             terminal.draw(|f| self.render(f))?;
             self.drain_file_changes()?;
+            self.scan_for_missed_changes()?;
             self.drain_control_commands()?;
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
@@ -100,6 +121,7 @@ impl App {
     fn handle_control_command(&mut self, command: ControlCommand) -> Result<()> {
         match command {
             ControlCommand::Open { path, line } => self.open_path(path, line)?,
+            ControlCommand::Highlight { path, line } => self.highlight_path(path, line)?,
             ControlCommand::Line(line) => self.focus_current_line(line),
             ControlCommand::TabNext => self.tabs.next(),
             ControlCommand::TabPrev => self.tabs.prev(),
@@ -131,6 +153,7 @@ impl App {
 
     fn remove_file(&mut self, path: &Path, at: SystemTime) {
         self.snapshots.remove(path);
+        self.seen_mtimes.remove(path);
         self.tabs.remove(path);
         self.last_change = Some(at);
     }
@@ -150,12 +173,45 @@ impl App {
         Ok(())
     }
 
+    fn highlight_path(&mut self, path: PathBuf, line: usize) -> Result<()> {
+        let path = if path.is_absolute() { path } else { self.root.join(path) };
+        let path = path.canonicalize().with_context(|| format!("highlight target does not exist: {}", path.display()))?;
+        self.remote_highlight = Some((path.clone(), line.saturating_sub(1)));
+        self.open_path(path, Some(line))
+    }
+
     fn focus_current_line(&mut self, line: usize) {
         if let Some(tab) = self.tabs.current_mut() {
             tab.focus_line = Some(line.saturating_sub(1));
             tab.auto_center = true;
             tab.selection = None;
         }
+    }
+
+    fn scan_for_missed_changes(&mut self) -> Result<()> {
+        if self.last_fallback_scan.elapsed() < FALLBACK_SCAN_INTERVAL { return Ok(()); }
+        self.last_fallback_scan = Instant::now();
+
+        let policy = IgnorePolicy::new(&self.root);
+        let mut current = HashMap::new();
+        let mut changed = Vec::new();
+        for entry in WalkDir::new(&self.root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() || !policy.allows(entry.path()) { continue; }
+            let Ok(metadata) = entry.metadata() else { continue; };
+            let Ok(modified) = metadata.modified() else { continue; };
+            let path = entry.path().to_path_buf();
+            current.insert(path.clone(), modified);
+            if self.seen_mtimes.get(&path).is_none_or(|old| *old < modified) {
+                changed.push((path, modified));
+            }
+        }
+
+        let removed = self.seen_mtimes.keys().filter(|path| !current.contains_key(*path)).cloned().collect::<Vec<_>>();
+        self.seen_mtimes = current;
+
+        for path in removed { self.remove_file(&path, SystemTime::now()); }
+        for (path, at) in changed { self.load_change(path, at)?; }
+        Ok(())
     }
 
     fn load_change(&mut self, path: PathBuf, at: SystemTime) -> Result<()> {
@@ -166,6 +222,7 @@ impl App {
         let first_change = diff.iter().position(|l| l.kind != LineKind::Unchanged);
         let focus_line = latest_snapshot_change_line(&old_snapshot, &content).or_else(|| diff.iter().rposition(|l| l.kind != LineKind::Unchanged));
         self.snapshots.insert(path.clone(), content.clone());
+        self.seen_mtimes.insert(path.clone(), at);
         let tab = Tab { path, content, highlighted_lines, diff, first_change, focus_line, scroll: 0, auto_center: true, selection: None, last_edit: at };
         self.last_change = Some(at);
         self.tabs.add_or_bring_to_front(tab);
@@ -206,7 +263,7 @@ impl App {
     fn git_line_kind(&self, diff: &str, line_no: usize) -> Option<crate::diff::LineKind> {
         let mut changed = false;
         for hunk in diff.lines().filter(|l| l.starts_with("@@ ")) {
-            let (old_range, new_range) = hunk.strip_prefix("@@ ")?.split_once(" @@")?;
+            let (old_range, new_range) = parse_hunk_header_ranges(hunk)?;
             let (_old_start, old_count) = parse_hunk_range(old_range, '-')?;
             let (new_start, new_count) = parse_hunk_range(new_range, '+')?;
             let end = new_start + new_count.saturating_sub(1);
@@ -312,11 +369,16 @@ impl App {
         };
         let height = area.height.saturating_sub(2) as usize;
         let lines = tab.diff.iter().enumerate().skip(tab.scroll).take(height).map(|(idx, dl)| {
+            let line_highlighted = self.remote_highlight.as_ref().is_some_and(|(path, line)| path == &tab.path && *line == idx);
             let mark = match dl.kind { LineKind::Added => "+", LineKind::Modified => "~", LineKind::Unchanged => " " };
             let mark_style = match dl.kind { LineKind::Added => Style::default().fg(Color::Green), LineKind::Modified => Style::default().fg(Color::Yellow), LineKind::Unchanged => Style::default().fg(Color::DarkGray) };
             let mut spans = vec![Span::styled(format!("{:>4} ", idx + 1), Style::default().fg(Color::DarkGray)), Span::styled(mark, mark_style), Span::raw(" ")];
             let base = tab.highlighted_lines.get(idx).cloned().unwrap_or_else(|| vec![Span::styled(dl.text.clone(), default_code_style())]);
-            spans.extend(apply_selection(&base, selection_range_for_line(tab.selection, idx, &dl.text)));
+            let mut code_spans = apply_selection(&base, selection_range_for_line(tab.selection, idx, &dl.text));
+            if line_highlighted {
+                code_spans = apply_style_range(&code_spans, leading_whitespace_chars(&dl.text), dl.text.chars().count(), highlight_line_style());
+            }
+            spans.extend(code_spans);
             Line::from(spans)
         }).collect::<Vec<_>>();
         f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL)), area);
@@ -328,7 +390,7 @@ impl App {
             let rel = tab.path.strip_prefix(&self.root).unwrap_or(&tab.path).display();
             let changes = tab.diff.iter().filter(|l| l.kind != LineKind::Unchanged).count();
             let ts: DateTime<Local> = tab.last_edit.into();
-            format!("{} | {} lines | {} changes | tab {}/{} | last edit {} | {}{}", rel, tab.content.lines().count(), changes, self.tabs.active + 1, self.tabs.len(), ts.format("%H:%M:%S"), if self.last_change.is_some() { "idle" } else { "waiting" }, if copied { " | copied" } else { "" })
+            format!("{} | {} lines | {} changes | tab {}/{} | last edit {} | {}{}{}", rel, tab.content.lines().count(), changes, self.tabs.active + 1, self.tabs.len(), ts.format("%H:%M:%S"), if self.last_change.is_some() { "idle" } else { "waiting" }, if copied { " | copied" } else { "" }, match self.remote_highlight.as_ref() { Some((path, line)) if path == &tab.path => format!(" | hl {}", line + 1), _ => String::new(), })
         } else { format!("watching {} | idle{}", self.root.display(), if copied { " | copied" } else { "" }) };
         f.render_widget(Paragraph::new(text), area);
     }
@@ -384,7 +446,34 @@ fn slice_chars(text: &str, start: usize, end: usize) -> String {
     text.chars().skip(start).take(end.saturating_sub(start)).collect()
 }
 
+fn leading_whitespace_chars(text: &str) -> usize {
+    text.chars().take_while(|c| c.is_whitespace()).count()
+}
+
+fn apply_style_range(spans: &[Span<'static>], start: usize, end: usize, style: Style) -> Vec<Span<'static>> {
+    if start >= end { return spans.to_vec(); }
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    for span in spans {
+        let len = span.content.chars().count();
+        let span_start = cursor;
+        let span_end = cursor + len;
+        let overlap_start = start.max(span_start);
+        let overlap_end = end.min(span_end);
+        if overlap_start >= overlap_end {
+            out.push(span.clone());
+        } else {
+            if overlap_start > span_start { out.push(Span::styled(slice_chars(span.content.as_ref(), 0, overlap_start - span_start), span.style)); }
+            out.push(Span::styled(slice_chars(span.content.as_ref(), overlap_start - span_start, overlap_end - span_start), span.style.patch(style)));
+            if overlap_end < span_end { out.push(Span::styled(slice_chars(span.content.as_ref(), overlap_end - span_start, len), span.style)); }
+        }
+        cursor = span_end;
+    }
+    out
+}
+
 fn selection_style() -> Style { Style::default().bg(Color::Rgb(62, 84, 122)) }
+fn highlight_line_style() -> Style { Style::default().bg(Color::Rgb(78, 72, 110)) }
 
 impl App {
     fn copy_selection_to_clipboard(&mut self) {
@@ -479,6 +568,13 @@ fn latest_snapshot_change_line(old: &str, new: &str) -> Option<usize> {
         }
     }
     None
+}
+
+fn parse_hunk_header_ranges(hunk: &str) -> Option<(&str, &str)> {
+    let header = hunk.strip_prefix("@@ ")?;
+    let (ranges, _) = header.split_once(" @@").unwrap_or((header, ""));
+    let mut parts = ranges.split_whitespace();
+    Some((parts.next()?, parts.next()?))
 }
 
 fn parse_hunk_range(range: &str, sign: char) -> Option<(usize, usize)> {
@@ -581,5 +677,30 @@ mod tests {
         let policy = IgnorePolicy::new(&root);
         assert!(!policy.allows(&root.join("target/debug/app")));
         assert!(policy.allows(&root.join("src/main.rs")));
+    }
+
+    #[test]
+    fn tracked_git_file_shows_added_line_after_change() {
+        use std::{fs, process::Command};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        Command::new("git").arg("init").arg(root).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["config", "user.email", "test@example.com"]).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["config", "user.name", "Test User"]).status().unwrap();
+
+        let path = root.join("main.rs");
+        fs::write(&path, (1..=21).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        Command::new("git").arg("-C").arg(root).args(["add", "."]).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["commit", "-m", "init"]).status().unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        fs::write(&path, (1..=22).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        app.load_change(path.clone(), SystemTime::now()).unwrap();
+
+        let tab = app.tabs.current().unwrap();
+        assert_eq!(tab.path, path.canonicalize().unwrap());
+        assert_eq!(tab.diff[21].kind, LineKind::Added);
     }
 }

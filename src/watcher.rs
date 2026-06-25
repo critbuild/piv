@@ -88,3 +88,54 @@ impl IgnorePolicy {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, sync::mpsc, time::Duration};
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn watcher_emits_changed_for_file_write() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let path = root.join("main.rs");
+        fs::write(&path, "fn main() {}\n").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let _watcher = FileWatcher::start(root.clone(), tx).unwrap();
+
+        fs::write(&path, "fn main() { println!(\"hi\"); }\n").unwrap();
+
+        let event = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        match event {
+            WatchEvent::Changed { path: changed, .. } => assert_eq!(changed, path),
+            other => panic!("expected changed event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watcher_emits_changed_for_atomic_replace() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let path = root.join("main.rs");
+        let tmp = root.join("main.rs.tmp");
+        fs::write(&path, "fn main() {}\n").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let _watcher = FileWatcher::start(root.clone(), tx).unwrap();
+
+        fs::write(&tmp, "fn main() { println!(\"hi\"); }\n").unwrap();
+        fs::rename(&tmp, &path).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if let Ok(WatchEvent::Changed { path: changed, .. }) = rx.recv_timeout(Duration::from_millis(200)) {
+                if changed == path { return; }
+            }
+        }
+        panic!("expected changed event for atomic replace");
+    }
+}

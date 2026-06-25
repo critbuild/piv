@@ -7,6 +7,7 @@ use crate::cli::{control_socket_path, parse_open_command};
 #[derive(Clone, Debug)]
 pub enum ControlCommand {
     Open { path: PathBuf, line: Option<usize> },
+    Highlight { path: PathBuf, line: usize },
     Line(usize),
     TabNext,
     TabPrev,
@@ -59,6 +60,7 @@ pub fn encode_control_command(command: &ControlCommand) -> String {
             Some(line) => format!("open {}:{}", path.display(), line),
             None => format!("open {}", path.display()),
         },
+        ControlCommand::Highlight { path, line } => format!("highlight {}:{}", path.display(), line),
         ControlCommand::Line(line) => format!("line {line}"),
         ControlCommand::TabNext => "next-tab".to_string(),
         ControlCommand::TabPrev => "prev-tab".to_string(),
@@ -70,6 +72,13 @@ pub fn parse_control_message(line: &str) -> Option<ControlCommand> {
     // Decode the tiny text protocol used by the control socket.
     let line = line.trim();
     if let Some(rest) = line.strip_prefix("open ") { return parse_open_command(rest).ok(); }
+    if let Some(rest) = line.strip_prefix("highlight ") {
+        let command = parse_open_command(rest).ok()?;
+        if let ControlCommand::Open { path, line: Some(line) } = command {
+            return Some(ControlCommand::Highlight { path, line });
+        }
+        return None;
+    }
     if let Some(rest) = line.strip_prefix("line ") { return rest.parse().ok().map(ControlCommand::Line); }
     match line {
         "next-tab" => Some(ControlCommand::TabNext),
