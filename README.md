@@ -49,6 +49,7 @@ piv --root /path/to/project --open src/main.rs:120
 - `Tab` and `Shift-Tab` switch tabs
 - arrow keys and page keys scroll
 - `[` and `]` jump between diff hunks
+- `\` toggles diff base between `HEAD` and `origin/main`
 - `c` re-center
 - `q` or `Ctrl-C` quit
 - mouse wheel scrolls

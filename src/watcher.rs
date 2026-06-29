@@ -32,11 +32,15 @@ impl FileWatcher {
                     }
                 }
             },
-            Config::default(),
+            watcher_config(),
         )?;
         watcher.watch(&root, RecursiveMode::Recursive)?;
         Ok(Self { _watcher: watcher })
     }
+}
+
+fn watcher_config() -> Config {
+    Config::default().with_follow_symlinks(false)
 }
 
 fn is_interesting_event(kind: &EventKind) -> bool {
@@ -113,6 +117,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn watcher_config_does_not_follow_symlinks() {
+        assert!(!watcher_config().follow_symlinks());
+    }
 
     #[test]
     fn watcher_emits_changed_for_file_write() {

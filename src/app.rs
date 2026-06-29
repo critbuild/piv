@@ -21,6 +21,28 @@ const AUTO_FOCUS_TOP_PADDING: usize = 2;
 const ASSUMED_EDITOR_BG: (u8, u8, u8) = (0x17, 0x23, 0x27);
 const AI_HIGHLIGHT_BG: (u8, u8, u8) = (78, 72, 110);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiffBase {
+    Head,
+    OriginMain,
+}
+
+impl DiffBase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Head => "HEAD",
+            Self::OriginMain => "origin/main",
+        }
+    }
+
+    fn toggle(self) -> Self {
+        match self {
+            Self::Head => Self::OriginMain,
+            Self::OriginMain => Self::Head,
+        }
+    }
+}
+
 pub struct App {
     root: PathBuf,
     rx: Receiver<WatchEvent>,
@@ -41,6 +63,7 @@ pub struct App {
     last_input_at: Instant,
     last_change: Option<SystemTime>,
     copy_notice_until: Option<Instant>,
+    diff_base: DiffBase,
 }
 
 impl App {
@@ -69,6 +92,7 @@ impl App {
             last_input_at: Instant::now(),
             last_change: None,
             copy_notice_until: None,
+            diff_base: DiffBase::Head,
         };
         app.seed_seen_mtimes()?;
         app.open_initial_file()?;
@@ -259,18 +283,41 @@ impl App {
     }
 
     fn diff_for_path(&self, path: &Path, content: &str) -> Vec<crate::diff::DiffLine> {
-        if let Some(old) = self.git_head_content(path) {
+        if let Some(old) = self.reference_content(path) {
             return DiffEngine::diff(&old, content);
         }
         let old = self.snapshots.get(path).map(String::as_str).unwrap_or("");
         DiffEngine::diff(old, content)
     }
 
-    fn git_head_content(&self, path: &Path) -> Option<String> {
+    fn reference_content(&self, path: &Path) -> Option<String> {
+        match self.diff_base {
+            DiffBase::Head => self.git_ref_content("HEAD", path),
+            DiffBase::OriginMain => {
+                if self.git_ref_exists("origin/main") {
+                    Some(self.git_ref_content("origin/main", path).unwrap_or_default())
+                } else {
+                    self.git_ref_content("HEAD", path)
+                }
+            }
+        }
+    }
+
+    fn git_ref_exists(&self, git_ref: &str) -> bool {
+        Command::new("git")
+            .arg("-C").arg(&self.root)
+            .args(["rev-parse", "--verify", "--quiet", git_ref])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn git_ref_content(&self, git_ref: &str, path: &Path) -> Option<String> {
         let rel = path.strip_prefix(&self.root).unwrap_or(path);
         let output = Command::new("git")
             .arg("-C").arg(&self.root)
-            .args(["show", &format!("HEAD:{}", rel.display())])
+            .args(["show", &format!("{}:{}", git_ref, rel.display())])
             .output()
             .ok()?;
         if output.status.success() {
@@ -292,6 +339,7 @@ impl App {
             (KeyCode::End, _) => if let Some(t) = self.tabs.current() { self.set_scroll(t.diff.len().saturating_sub(1)); },
             (KeyCode::Char('['), _) => self.jump_to_diff(false),
             (KeyCode::Char(']'), _) => self.jump_to_diff(true),
+            (KeyCode::Char('\\'), _) => self.toggle_diff_base(),
             (KeyCode::Char('c'), _) => if let Some(t) = self.tabs.current_mut() { t.auto_center = true; },
             _ => {}
         }
@@ -348,9 +396,10 @@ impl App {
         Some(TextPoint { line, column: text_column.min(text.chars().count()) })
     }
 
-    fn set_scroll(&mut self, n: usize) { if let Some(t) = self.tabs.current_mut() { t.scroll = n; t.auto_center = false; } }
-    fn scroll_up(&mut self, n: usize) { if let Some(t) = self.tabs.current_mut() { t.scroll = t.scroll.saturating_sub(n); t.auto_center = false; } }
-    fn scroll_down(&mut self, n: usize) { if let Some(t) = self.tabs.current_mut() { t.scroll = (t.scroll + n).min(t.diff.len().saturating_sub(1)); t.auto_center = false; } }
+    fn viewport_height(&self) -> usize { self.code_area.height.saturating_sub(2) as usize }
+    fn set_scroll(&mut self, n: usize) { let h = self.viewport_height(); if let Some(t) = self.tabs.current_mut() { t.scroll = n; t.auto_center = false; clamp_tab_scroll(t, h); } }
+    fn scroll_up(&mut self, n: usize) { let h = self.viewport_height(); if let Some(t) = self.tabs.current_mut() { t.scroll = t.scroll.saturating_sub(n); t.auto_center = false; clamp_tab_scroll(t, h); } }
+    fn scroll_down(&mut self, n: usize) { let h = self.viewport_height(); if let Some(t) = self.tabs.current_mut() { t.scroll = (t.scroll + n).min(t.diff.len().saturating_sub(1)); t.auto_center = false; clamp_tab_scroll(t, h); } }
 
     fn jump_to_diff(&mut self, forward: bool) {
         let height = self.code_area.height.saturating_sub(2) as usize;
@@ -455,9 +504,43 @@ impl App {
             let rel = tab.path.strip_prefix(&self.root).unwrap_or(&tab.path).display();
             let changes = tab.diff.iter().filter(|l| l.kind != LineKind::Unchanged).count();
             let ts: DateTime<Local> = tab.last_edit.into();
-            format!("{} | {} lines | {} changes | tab {}/{} | last edit {} | {}{}{}", rel, tab.content.lines().count(), changes, self.tabs.active + 1, self.tabs.len(), ts.format("%H:%M:%S"), if self.last_change.is_some() { "idle" } else { "waiting" }, if copied { " | copied" } else { "" }, match self.remote_highlight.as_ref() { Some((path, start_line, end_line, at)) if path == &tab.path && at.elapsed() < HIGHLIGHT_FADE_DURATION => if start_line == end_line { format!(" | hl {}", start_line + 1) } else { format!(" | hl {}-{}", start_line + 1, end_line + 1) }, _ => String::new(), })
-        } else { format!("watching {} | idle{}", self.root.display(), if copied { " | copied" } else { "" }) };
+            format!("{} | diff {} | {} lines | {} changes | tab {}/{} | last edit {} | {}{}{}", rel, self.diff_base.label(), tab.content.lines().count(), changes, self.tabs.active + 1, self.tabs.len(), ts.format("%H:%M:%S"), if self.last_change.is_some() { "idle" } else { "waiting" }, if copied { " | copied" } else { "" }, match self.remote_highlight.as_ref() { Some((path, start_line, end_line, at)) if path == &tab.path && at.elapsed() < HIGHLIGHT_FADE_DURATION => if start_line == end_line { format!(" | hl {}", start_line + 1) } else { format!(" | hl {}-{}", start_line + 1, end_line + 1) }, _ => String::new(), })
+        } else { format!("watching {} | diff {} | idle{}", self.root.display(), self.diff_base.label(), if copied { " | copied" } else { "" }) };
         f.render_widget(Paragraph::new(text), area);
+    }
+}
+
+impl App {
+    fn toggle_diff_base(&mut self) {
+        self.diff_base = self.diff_base.toggle();
+        self.refresh_open_tab_diffs();
+    }
+
+    fn refresh_open_tab_diffs(&mut self) {
+        let updates = self.tabs.tabs.iter().map(|tab| {
+            let diff = match self.reference_content(&tab.path) {
+                Some(old) => DiffEngine::diff(&old, &tab.content),
+                None => {
+                    let old = self.snapshots.get(&tab.path).map(String::as_str).unwrap_or("");
+                    DiffEngine::diff(old, &tab.content)
+                }
+            };
+            let first_change = diff.iter().position(|l| l.kind != LineKind::Unchanged);
+            let prepared_rows = prepare_rows(&diff, &tab.highlighted_lines);
+            (diff, prepared_rows, first_change)
+        }).collect::<Vec<_>>();
+
+        for (tab, (diff, prepared_rows, first_change)) in self.tabs.tabs.iter_mut().zip(updates) {
+            tab.prepared_rows = prepared_rows;
+            tab.diff = diff;
+            tab.first_change = first_change;
+            tab.focus_line = first_change;
+            tab.center_diff = None;
+            tab.scroll = 0;
+            tab.auto_center = true;
+            tab.selection = None;
+            tab.viewport_cache = None;
+        }
     }
 }
 
@@ -467,6 +550,15 @@ fn center_tab(tab: &mut Tab, height: usize) {
             tab.scroll = line.saturating_sub(AUTO_FOCUS_TOP_PADDING.min(height.saturating_sub(1)));
         }
     }
+    // Clamp last so the viewport stays aligned with EOF: when the focus line or
+    // a manual scroll would land past the last full page, pin the scroll so the
+    // final page fills the viewport instead of leaving blank filler underneath.
+    clamp_tab_scroll(tab, height);
+}
+
+fn clamp_tab_scroll(tab: &mut Tab, height: usize) {
+    let max_scroll = tab.diff.len().saturating_sub(height);
+    tab.scroll = tab.scroll.min(max_scroll);
 }
 
 fn diff_hunks(diff: &[crate::diff::DiffLine]) -> Vec<(usize, usize)> {
@@ -814,9 +906,36 @@ mod tests {
 
     #[test]
     fn center_tab_places_focus_near_top() {
-        let mut tab = Tab { path: PathBuf::from("a"), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: Some(20), center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        // 40-line diff so the focus line sits within range and clamp does not pin it.
+        let diff: Vec<crate::diff::DiffLine> = (0..40)
+            .map(|i| crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(i + 1), new_line_no: Some(i + 1), text: format!("line {i}") })
+            .collect();
+        let mut tab = Tab { path: PathBuf::from("a"), content: String::new(), highlighted_lines: vec![], diff, prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: Some(20), center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
         center_tab(&mut tab, 20);
         assert_eq!(tab.scroll, 18);
+    }
+
+    #[test]
+    fn center_tab_clamps_scroll_near_eof() {
+        // 30-line file, 10-row viewport, focus on the last line: the last page
+        // fills the viewport rather than leaving blank filler underneath.
+        let diff: Vec<crate::diff::DiffLine> = (0..30)
+            .map(|i| crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(i + 1), new_line_no: Some(i + 1), text: format!("line {i}") })
+            .collect();
+        let mut tab = Tab { path: PathBuf::from("a"), content: String::new(), highlighted_lines: vec![], diff, prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: Some(29), center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        center_tab(&mut tab, 10);
+        assert_eq!(tab.scroll, 20);
+    }
+
+    #[test]
+    fn clamp_tab_scroll_pins_short_file_to_top() {
+        // Shorter-than-viewport file: scroll collapses to 0 so EOF sits flush.
+        let diff: Vec<crate::diff::DiffLine> = (0..5)
+            .map(|i| crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(i + 1), new_line_no: Some(i + 1), text: format!("line {i}") })
+            .collect();
+        let mut tab = Tab { path: PathBuf::from("a"), content: String::new(), highlighted_lines: vec![], diff, prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: Some(4), center_diff: None, scroll: 100, auto_center: false, selection: None, last_edit: SystemTime::now() };
+        clamp_tab_scroll(&mut tab, 10);
+        assert_eq!(tab.scroll, 0);
     }
 
     #[test]
@@ -914,5 +1033,36 @@ mod tests {
         let tab = app.tabs.current().unwrap();
         assert_eq!(tab.path, path.canonicalize().unwrap());
         assert_eq!(tab.diff[21].kind, LineKind::Added);
+    }
+
+    #[test]
+    fn origin_main_diff_base_shows_worktree_change_against_remote_main() {
+        use std::{fs, process::Command};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let remote = root.join("remote.git");
+
+        Command::new("git").arg("init").arg("-b").arg("main").arg(root).status().unwrap();
+        Command::new("git").arg("init").arg("--bare").arg(&remote).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["config", "user.email", "test@example.com"]).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["config", "user.name", "Test User"]).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["remote", "add", "origin", remote.to_str().unwrap()]).status().unwrap();
+
+        let path = root.join("main.rs");
+        fs::write(&path, "fn main() {}\n").unwrap();
+        Command::new("git").arg("-C").arg(root).args(["add", "."]).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["commit", "-m", "init"]).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["push", "-u", "origin", "main"]).status().unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        fs::write(&path, "fn main() {}\nprintln!(\"hi\");\n").unwrap();
+        app.diff_base = DiffBase::OriginMain;
+        app.load_change(path.clone(), SystemTime::now()).unwrap();
+
+        let tab = app.tabs.current().unwrap();
+        assert_eq!(tab.path, path.canonicalize().unwrap());
+        assert_eq!(tab.diff[1].kind, LineKind::Added);
     }
 }
