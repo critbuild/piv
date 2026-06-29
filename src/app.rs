@@ -16,6 +16,7 @@ const BATCH_WINDOW: Duration = Duration::from_millis(120);
 const MOUSE_SCROLL_LINES: usize = 5;
 const FALLBACK_SCAN_INTERVAL: Duration = Duration::from_millis(750);
 const FALLBACK_SCAN_IDLE_DELAY: Duration = Duration::from_millis(1200);
+const GIT_REF_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const HIGHLIGHT_FADE_DURATION: Duration = Duration::from_secs(10);
 const AUTO_FOCUS_TOP_PADDING: usize = 2;
 const ASSUMED_EDITOR_BG: (u8, u8, u8) = (0x17, 0x23, 0x27);
@@ -64,6 +65,8 @@ pub struct App {
     last_change: Option<SystemTime>,
     copy_notice_until: Option<Instant>,
     diff_base: DiffBase,
+    last_git_ref_probe: Instant,
+    last_seen_diff_base_rev: Option<String>,
 }
 
 impl App {
@@ -93,7 +96,10 @@ impl App {
             last_change: None,
             copy_notice_until: None,
             diff_base: DiffBase::Head,
+            last_git_ref_probe: Instant::now(),
+            last_seen_diff_base_rev: None,
         };
+        app.last_seen_diff_base_rev = app.current_diff_base_rev();
         app.seed_seen_mtimes()?;
         app.open_initial_file()?;
         Ok(app)
@@ -131,6 +137,7 @@ impl App {
 
             if self.drain_file_changes()? { should_draw = true; }
             if self.scan_for_missed_changes()? { should_draw = true; }
+            if self.scan_for_git_ref_changes() { should_draw = true; }
             if self.drain_control_commands()? { should_draw = true; }
 
             let timeout = if self.remote_highlight.is_some() { Duration::from_millis(33) } else { Duration::from_millis(250) };
@@ -326,6 +333,43 @@ impl App {
         None
     }
 
+    fn current_diff_base_rev(&self) -> Option<String> {
+        let git_ref = match self.diff_base {
+            DiffBase::Head => Some("HEAD"),
+            DiffBase::OriginMain => if self.git_ref_exists("origin/main") { Some("origin/main") } else { Some("HEAD") },
+        }?;
+        self.git_ref_oid(git_ref)
+    }
+
+    fn git_ref_oid(&self, git_ref: &str) -> Option<String> {
+        let output = Command::new("git")
+            .arg("-C").arg(&self.root)
+            .args(["rev-parse", "--verify", "--quiet", git_ref])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!oid.is_empty()).then_some(oid)
+    }
+
+    fn scan_for_git_ref_changes(&mut self) -> bool {
+        if self.last_git_ref_probe.elapsed() < GIT_REF_REFRESH_INTERVAL {
+            return false;
+        }
+        self.last_git_ref_probe = Instant::now();
+        let current = self.current_diff_base_rev();
+        if current == self.last_seen_diff_base_rev {
+            return false;
+        }
+        self.last_seen_diff_base_rev = current;
+        self.refresh_open_tab_diffs();
+        true
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return true,
@@ -513,6 +557,7 @@ impl App {
 impl App {
     fn toggle_diff_base(&mut self) {
         self.diff_base = self.diff_base.toggle();
+        self.last_seen_diff_base_rev = self.current_diff_base_rev();
         self.refresh_open_tab_diffs();
     }
 
@@ -1041,8 +1086,9 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
+        let remote_dir = tempdir().unwrap();
         let root = dir.path();
-        let remote = root.join("remote.git");
+        let remote = remote_dir.path().join("remote.git");
 
         Command::new("git").arg("init").arg("-b").arg("main").arg(root).status().unwrap();
         Command::new("git").arg("init").arg("--bare").arg(&remote).status().unwrap();
@@ -1057,12 +1103,49 @@ mod tests {
         Command::new("git").arg("-C").arg(root).args(["push", "-u", "origin", "main"]).status().unwrap();
 
         let mut app = App::new(root.to_path_buf()).unwrap();
+        app.toggle_diff_base();
         fs::write(&path, "fn main() {}\nprintln!(\"hi\");\n").unwrap();
-        app.diff_base = DiffBase::OriginMain;
         app.load_change(path.clone(), SystemTime::now()).unwrap();
 
         let tab = app.tabs.current().unwrap();
         assert_eq!(tab.path, path.canonicalize().unwrap());
         assert_eq!(tab.diff[1].kind, LineKind::Added);
+    }
+
+    #[test]
+    fn origin_main_push_refreshes_open_diff_without_file_change() {
+        use std::{fs, process::Command};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let remote_dir = tempdir().unwrap();
+        let root = dir.path();
+        let remote = remote_dir.path().join("remote.git");
+
+        Command::new("git").arg("init").arg("-b").arg("main").arg(root).status().unwrap();
+        Command::new("git").arg("init").arg("--bare").arg(&remote).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["config", "user.email", "test@example.com"]).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["config", "user.name", "Test User"]).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["remote", "add", "origin", remote.to_str().unwrap()]).status().unwrap();
+
+        let path = root.join("main.rs");
+        fs::write(&path, "fn main() {}\n").unwrap();
+        Command::new("git").arg("-C").arg(root).args(["add", "."]).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["commit", "-m", "init"]).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["push", "-u", "origin", "main"]).status().unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.toggle_diff_base();
+        fs::write(&path, "fn main() {}\nprintln!(\"hi\");\n").unwrap();
+        app.load_change(path.clone(), SystemTime::now()).unwrap();
+        assert_eq!(app.tabs.current().unwrap().diff.iter().filter(|l| l.kind != LineKind::Unchanged).count(), 1);
+
+        Command::new("git").arg("-C").arg(root).args(["add", "."]).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["commit", "-m", "second"]).status().unwrap();
+        Command::new("git").arg("-C").arg(root).args(["push", "origin", "main"]).status().unwrap();
+
+        app.last_git_ref_probe = Instant::now() - GIT_REF_REFRESH_INTERVAL;
+        assert!(app.scan_for_git_ref_changes());
+        assert_eq!(app.tabs.current().unwrap().diff.iter().filter(|l| l.kind != LineKind::Unchanged).count(), 0);
     }
 }

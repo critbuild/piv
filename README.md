@@ -7,6 +7,7 @@ It watches a project directory for file changes, opens changed files in tabs, hi
 ## Features
 
 - filesystem watch for create, write, rename, delete
+- refresh open diffs when the selected git base moves after commit or push
 - LRU tab strip
 - change gutter for added and modified lines
 - tree-sitter highlighting for `rs`, `ts`, `tsx`, `js`, `jsx`
