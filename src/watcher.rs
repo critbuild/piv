@@ -80,27 +80,7 @@ impl IgnorePolicy {
 
     pub fn allows(&self, path: &Path) -> bool {
         let rel = path.strip_prefix(&self.root).unwrap_or(path);
-        if rel.components().any(|c| {
-            let s = c.as_os_str().to_string_lossy();
-            matches!(
-                s.as_ref(),
-                ".git"
-                    | "target"
-                    | "node_modules"
-                    | "__pycache__"
-                    | ".idea"
-                    | ".vscode"
-                    | "cache"
-                    | ".cache"
-                    | ".pytest_cache"
-                    | ".mypy_cache"
-                    | ".ruff_cache"
-                    | "dist"
-                    | "build"
-                    | ".venv"
-                    | "venv"
-            )
-        }) {
+        if rel.components().any(|c| is_ignored_component(&c.as_os_str().to_string_lossy())) {
             return false;
         }
         if let Some(gi) = &self.gitignore {
@@ -108,6 +88,27 @@ impl IgnorePolicy {
         }
         true
     }
+}
+
+fn is_ignored_component(component: &str) -> bool {
+    matches!(
+        component,
+        ".git"
+            | "target"
+            | "node_modules"
+            | "__pycache__"
+            | ".idea"
+            | ".vscode"
+            | "cache"
+            | ".cache"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | ".ruff_cache"
+            | "dist"
+            | "build"
+            | ".venv"
+            | "venv"
+    ) || component.ends_with(".egg-info")
 }
 
 #[cfg(test)]
@@ -179,6 +180,8 @@ mod tests {
             "build/output.bin",
             ".venv/bin/python",
             "venv/bin/python",
+            "src/tomi.egg-info/SOURCES.txt",
+            "package.egg-info/PKG-INFO",
         ] {
             assert!(!policy.allows(&root.join(rel)), "expected {rel} to be ignored");
         }
