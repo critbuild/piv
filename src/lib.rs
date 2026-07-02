@@ -1,5 +1,6 @@
 pub mod app;
 pub mod cli;
+pub mod code_pane;
 pub mod control;
 pub mod diff;
 pub mod highlight;

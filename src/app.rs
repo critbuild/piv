@@ -3,11 +3,11 @@ use std::{collections::HashMap, fs, io::Write, path::{Path, PathBuf}, process::{
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local};
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::{backend::CrosstermBackend, layout::{Constraint, Direction, Layout, Rect}, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::{Block, Borders, Paragraph}, Frame, Terminal};
+use ratatui::{backend::CrosstermBackend, layout::{Constraint, Direction, Layout, Rect}, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::Paragraph, Frame, Terminal};
 use similar::TextDiff;
 use walkdir::WalkDir;
 
-use crate::{control::{ControlCommand, ControlServer}, diff::{DiffEngine, LineKind}, highlight::{default_code_style, Highlighter}, model::{PreparedRow, Selection, Tab, TabHit, TabManager, TextPoint}, search::{Match as SearchMatch, SearchQuery}, watcher::{FileWatcher, IgnorePolicy, WatchEvent}};
+use crate::{code_pane::{code_prefix_width, prepare_rows, render_code_pane, CodePaneOverlays, RemoteHighlightOverlay, SearchOverlay}, control::{ControlCommand, ControlServer}, diff::{DiffEngine, LineKind}, highlight::Highlighter, model::{Selection, Tab, TabHit, TabManager, TextPoint}, search::{Match as SearchMatch, SearchQuery}, watcher::{FileWatcher, IgnorePolicy, WatchEvent}};
 
 use arboard::Clipboard;
 
@@ -18,8 +18,6 @@ const FALLBACK_SCAN_INTERVAL: Duration = Duration::from_millis(750);
 const FALLBACK_SCAN_IDLE_DELAY: Duration = Duration::from_millis(1200);
 const GIT_REF_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const HIGHLIGHT_FADE_DURATION: Duration = Duration::from_secs(10);
-const SEARCH_MATCH_BG: (u8, u8, u8) = (96, 74, 30);
-const SEARCH_CURRENT_BG: (u8, u8, u8) = (180, 138, 40);
 const AUTO_FOCUS_TOP_PADDING: usize = 2;
 const ASSUMED_EDITOR_BG: (u8, u8, u8) = (0x17, 0x23, 0x27);
 const AI_HIGHLIGHT_BG: (u8, u8, u8) = (78, 72, 110);
@@ -456,10 +454,10 @@ impl App {
     }
 
     fn mouse_point_to_text_point(&self, column: u16, row: u16) -> Option<TextPoint> {
-        let inner_x = self.code_area.x.saturating_add(1);
-        let inner_y = self.code_area.y.saturating_add(1);
-        let inner_width = self.code_area.width.saturating_sub(2);
-        let inner_height = self.code_area.height.saturating_sub(2);
+        let inner_x = self.code_area.x;
+        let inner_y = self.code_area.y;
+        let inner_width = self.code_area.width;
+        let inner_height = self.code_area.height;
         if column < inner_x || row < inner_y || column >= inner_x.saturating_add(inner_width) || row >= inner_y.saturating_add(inner_height) { return None; }
         let line = self.tabs.current()?.scroll + usize::from(row.saturating_sub(inner_y));
         let text = self.tabs.current()?.diff.get(line)?.text.as_str();
@@ -468,7 +466,7 @@ impl App {
         Some(TextPoint { line, column: text_column.min(text.chars().count()) })
     }
 
-    fn viewport_height(&self) -> usize { self.code_area.height.saturating_sub(2) as usize }
+    fn viewport_height(&self) -> usize { self.code_area.height as usize }
     fn set_scroll(&mut self, n: usize) { let h = self.viewport_height(); if let Some(t) = self.tabs.current_mut() { t.scroll = n; t.auto_center = false; clamp_tab_scroll(t, h); } }
     fn scroll_up(&mut self, n: usize) { let h = self.viewport_height(); if let Some(t) = self.tabs.current_mut() { t.scroll = t.scroll.saturating_sub(n); t.auto_center = false; clamp_tab_scroll(t, h); } }
     fn scroll_down(&mut self, n: usize) { let h = self.viewport_height(); if let Some(t) = self.tabs.current_mut() { t.scroll = (t.scroll + n).min(t.diff.len().saturating_sub(1)); t.auto_center = false; clamp_tab_scroll(t, h); } }
@@ -532,59 +530,29 @@ impl App {
     }
 
     fn render_code(&mut self, f: &mut Frame, area: Rect) {
-        let render_height = area.height.saturating_sub(2) as usize;
+        let height = area.height as usize;
         let Some(tab) = self.tabs.current_mut() else {
-            f.render_widget(Paragraph::new("No source files found yet. Waiting for changes...").block(Block::default().borders(Borders::ALL)), area);
+            f.render_widget(Paragraph::new(Span::styled("No source files found yet. Waiting for changes...", Style::default().fg(Color::DarkGray))), area);
             return;
         };
-        center_tab(tab, render_height);
-        if let Some(center) = visible_diff_center(&tab.diff, tab.scroll, render_height) {
+        center_tab(tab, height);
+        if let Some(center) = visible_diff_center(&tab.diff, tab.scroll, height) {
             tab.center_diff = Some(center);
         }
 
-        let height = area.height.saturating_sub(2) as usize;
-        let highlight_style = self.remote_highlight.as_ref().and_then(|(_, _, _, at)| highlight_line_style(*at));
-        let selection_active = tab.selection.is_some();
-        let search = self.last_search.as_ref().filter(|s| s.path == tab.path);
-        let search_active = search.is_some();
-        let static_only = !selection_active && !search_active && highlight_style.is_none();
-        let lines = if static_only {
-            cached_static_viewport_lines(tab, height)
-        } else {
-            let current_match = search.and_then(|s| s.matches.get(s.current));
-            tab.diff.iter().zip(tab.prepared_rows.iter()).enumerate().skip(tab.scroll).take(height).map(|(idx, (dl, row))| {
-                let line_highlighted = self.remote_highlight.as_ref().is_some_and(|(path, start_line, end_line, _)| {
-                    path == &tab.path
-                        && row.new_line_no.is_some_and(|line| ((start_line + 1)..=(end_line + 1)).contains(&line))
-                });
-                let line_matches: Vec<&SearchMatch> = search.map(|s| s.matches.iter().filter(|m| m.line == idx).collect()).unwrap_or_default();
-                if !selection_active && !line_highlighted && line_matches.is_empty() {
-                    return row.static_line.clone();
-                }
-                let mark = match row.kind { LineKind::Added => "+", LineKind::Removed => "-", LineKind::Unchanged => " " };
-                let mark_style = match row.kind { LineKind::Added => Style::default().fg(Color::Green), LineKind::Removed => Style::default().fg(Color::Red), LineKind::Unchanged => Style::default().fg(Color::DarkGray) };
-                let mut spans = vec![Span::styled(format!("{:>4} ", row.line_no), Style::default().fg(Color::DarkGray)), Span::styled(mark, mark_style), Span::raw(" ")];
-                let mut code_spans = if selection_active {
-                    apply_selection(&row.base_spans, selection_range_for_line(tab.selection, idx, &dl.text))
-                } else {
-                    row.base_spans.clone()
-                };
-                if row.kind == LineKind::Removed {
-                    code_spans = apply_style_range(&code_spans, row.leading_ws, row.text_len, removed_line_style());
-                }
-                if line_highlighted {
-                    if let Some(style) = highlight_style {
-                        code_spans = apply_style_range(&code_spans, row.leading_ws, row.text_len, style);
-                    }
-                }
-                if !line_matches.is_empty() {
-                    code_spans = apply_search_matches(&code_spans, &line_matches, current_match);
-                }
-                spans.extend(code_spans);
-                Line::from(spans)
-            }).collect::<Vec<_>>()
-        };
-        f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL)), area);
+        let remote_highlight = self.remote_highlight.as_ref().and_then(|(path, start_line, end_line, at)| {
+            if path == &tab.path {
+                highlight_line_style(*at).map(|style| RemoteHighlightOverlay { start_line: *start_line, end_line: *end_line, style })
+            } else {
+                None
+            }
+        });
+        let search = self.last_search.as_ref()
+            .filter(|search| search.path == tab.path)
+            .map(|search| SearchOverlay { matches: search.matches.as_slice(), current: search.current });
+        let selection = tab.selection;
+        let lines = render_code_pane(tab, height, CodePaneOverlays { selection, remote_highlight, search });
+        f.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_search_prompt(&self, f: &mut Frame, area: Rect) {
@@ -706,133 +674,6 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x && row >= rect.y && column < rect.x.saturating_add(rect.width) && row < rect.y.saturating_add(rect.height)
 }
 
-fn code_prefix_width() -> usize { 7 }
-
-fn cached_static_viewport_lines(tab: &mut Tab, height: usize) -> Vec<Line<'static>> {
-    if let Some(cache) = &mut tab.viewport_cache {
-        if cache.height == height {
-            if cache.scroll == tab.scroll {
-                return cache.lines.clone();
-            }
-            if cache.scroll + 1 == tab.scroll {
-                if !cache.lines.is_empty() { cache.lines.remove(0); }
-                let next_idx = tab.scroll + height.saturating_sub(1);
-                if let Some(row) = tab.prepared_rows.get(next_idx) { cache.lines.push(row.static_line.clone()); }
-                cache.scroll = tab.scroll;
-                return cache.lines.clone();
-            }
-            if tab.scroll + 1 == cache.scroll {
-                let _ = cache.lines.pop();
-                if let Some(row) = tab.prepared_rows.get(tab.scroll) { cache.lines.insert(0, row.static_line.clone()); }
-                cache.scroll = tab.scroll;
-                return cache.lines.clone();
-            }
-        }
-    }
-
-    let lines = tab.prepared_rows.iter().skip(tab.scroll).take(height).map(|row| row.static_line.clone()).collect::<Vec<_>>();
-    tab.viewport_cache = Some(crate::model::ViewportCache { scroll: tab.scroll, height, lines: lines.clone() });
-    lines
-}
-
-fn prepare_rows(diff: &[crate::diff::DiffLine], highlighted_lines: &[Vec<Span<'static>>]) -> Vec<PreparedRow> {
-    diff.iter().enumerate().map(|(idx, dl)| {
-        let kind = dl.kind.clone();
-        let line_no = dl.new_line_no.or(dl.old_line_no).unwrap_or(idx + 1);
-        let leading_ws = leading_whitespace_chars(&dl.text);
-        let text_len = dl.text.chars().count();
-        let base_spans = dl.new_line_no
-            .and_then(|line| highlighted_lines.get(line.saturating_sub(1)).cloned())
-            .unwrap_or_else(|| vec![Span::styled(dl.text.clone(), default_code_style())]);
-        let mut static_code_spans = base_spans.clone();
-        if kind == LineKind::Removed {
-            static_code_spans = apply_style_range(&static_code_spans, leading_ws, text_len, removed_line_style());
-        }
-        let mark = match kind { LineKind::Added => "+", LineKind::Removed => "-", LineKind::Unchanged => " " };
-        let mark_style = match kind { LineKind::Added => Style::default().fg(Color::Green), LineKind::Removed => Style::default().fg(Color::Red), LineKind::Unchanged => Style::default().fg(Color::DarkGray) };
-        let mut spans = vec![
-            Span::styled(format!("{:>4} ", line_no), Style::default().fg(Color::DarkGray)),
-            Span::styled(mark, mark_style),
-            Span::raw(" "),
-        ];
-        spans.extend(static_code_spans);
-        PreparedRow {
-            kind,
-            line_no,
-            new_line_no: dl.new_line_no,
-            leading_ws,
-            text_len,
-            base_spans,
-            static_line: Line::from(spans),
-        }
-    }).collect()
-}
-
-fn selection_range_for_line(selection: Option<Selection>, line: usize, text: &str) -> Option<(usize, usize)> {
-    let selection = selection?;
-    let (start, end) = if selection.anchor <= selection.focus { (selection.anchor, selection.focus) } else { (selection.focus, selection.anchor) };
-    if line < start.line || line > end.line { return None; }
-    let line_len = text.chars().count();
-    if start.line == end.line { return Some((start.column.min(line_len), end.column.min(line_len))); }
-    if line == start.line { return Some((start.column.min(line_len), line_len)); }
-    if line == end.line { return Some((0, end.column.min(line_len))); }
-    Some((0, line_len))
-}
-
-fn apply_selection(spans: &[Span<'static>], range: Option<(usize, usize)>) -> Vec<Span<'static>> {
-    let Some((start, end)) = range else { return spans.to_vec(); };
-    if start >= end { return spans.to_vec(); }
-    let mut out = Vec::new();
-    let mut cursor = 0usize;
-    for span in spans {
-        let len = span.content.chars().count();
-        let span_start = cursor;
-        let span_end = cursor + len;
-        let overlap_start = start.max(span_start);
-        let overlap_end = end.min(span_end);
-        if overlap_start >= overlap_end {
-            out.push(span.clone());
-        } else {
-            if overlap_start > span_start { out.push(Span::styled(slice_chars(span.content.as_ref(), 0, overlap_start - span_start), span.style)); }
-            out.push(Span::styled(slice_chars(span.content.as_ref(), overlap_start - span_start, overlap_end - span_start), span.style.patch(selection_style())));
-            if overlap_end < span_end { out.push(Span::styled(slice_chars(span.content.as_ref(), overlap_end - span_start, len), span.style)); }
-        }
-        cursor = span_end;
-    }
-    out
-}
-
-fn slice_chars(text: &str, start: usize, end: usize) -> String {
-    text.chars().skip(start).take(end.saturating_sub(start)).collect()
-}
-
-fn leading_whitespace_chars(text: &str) -> usize {
-    text.chars().take_while(|c| c.is_whitespace()).count()
-}
-
-fn apply_style_range(spans: &[Span<'static>], start: usize, end: usize, style: Style) -> Vec<Span<'static>> {
-    if start >= end { return spans.to_vec(); }
-    let mut out = Vec::new();
-    let mut cursor = 0usize;
-    for span in spans {
-        let len = span.content.chars().count();
-        let span_start = cursor;
-        let span_end = cursor + len;
-        let overlap_start = start.max(span_start);
-        let overlap_end = end.min(span_end);
-        if overlap_start >= overlap_end {
-            out.push(span.clone());
-        } else {
-            if overlap_start > span_start { out.push(Span::styled(slice_chars(span.content.as_ref(), 0, overlap_start - span_start), span.style)); }
-            out.push(Span::styled(slice_chars(span.content.as_ref(), overlap_start - span_start, overlap_end - span_start), span.style.patch(style)));
-            if overlap_end < span_end { out.push(Span::styled(slice_chars(span.content.as_ref(), overlap_end - span_start, len), span.style)); }
-        }
-        cursor = span_end;
-    }
-    out
-}
-
-fn selection_style() -> Style { Style::default().bg(Color::Rgb(62, 84, 122)) }
 fn highlight_line_style(started_at: Instant) -> Option<Style> {
     let elapsed = started_at.elapsed();
     if elapsed >= HIGHLIGHT_FADE_DURATION { return None; }
@@ -844,21 +685,6 @@ fn highlight_line_style(started_at: Instant) -> Option<Style> {
         blend(AI_HIGHLIGHT_BG.2, ASSUMED_EDITOR_BG.2),
     )))
 }
-fn removed_line_style() -> Style { Style::default().bg(Color::Rgb(92, 48, 48)) }
-fn search_match_style() -> Style { Style::default().bg(Color::Rgb(SEARCH_MATCH_BG.0, SEARCH_MATCH_BG.1, SEARCH_MATCH_BG.2)) }
-fn search_current_style() -> Style { Style::default().bg(Color::Rgb(SEARCH_CURRENT_BG.0, SEARCH_CURRENT_BG.1, SEARCH_CURRENT_BG.2)).add_modifier(Modifier::BOLD) }
-
-fn apply_search_matches(spans: &[Span<'static>], line_matches: &[&SearchMatch], current: Option<&SearchMatch>) -> Vec<Span<'static>> {
-    // Apply right-to-left so earlier character offsets stay valid as we split spans.
-    let mut out = spans.to_vec();
-    for m in line_matches.iter().rev() {
-        let is_current = current.is_some_and(|c| c.line == m.line && c.column == m.column);
-        let style = if is_current { search_current_style() } else { search_match_style() };
-        out = apply_style_range(&out, m.column, m.end, style);
-    }
-    out
-}
-
 impl App {
     fn begin_search(&mut self) {
         self.search_input = Some(String::new());
@@ -1036,7 +862,6 @@ fn latest_snapshot_change_line(old: &str, new: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use std::{path::Path, time::SystemTime};
-    use ratatui::text::Span;
     use super::*;
     use crate::watcher::IgnorePolicy;
 
@@ -1209,20 +1034,20 @@ mod tests {
     }
 
     #[test]
-    fn selection_range_handles_multiline_drag() {
-        let selection = Selection { anchor: TextPoint { line: 3, column: 5 }, focus: TextPoint { line: 5, column: 2 } };
-        assert_eq!(selection_range_for_line(Some(selection), 2, "abcd"), None);
-        assert_eq!(selection_range_for_line(Some(selection), 3, "abcdefgh"), Some((5, 8)));
-        assert_eq!(selection_range_for_line(Some(selection), 4, "abc"), Some((0, 3)));
-        assert_eq!(selection_range_for_line(Some(selection), 5, "abcdef"), Some((0, 2)));
-    }
+    fn borderless_code_pane_mouse_coordinates_start_at_area_origin() {
+        use std::fs;
+        use tempfile::tempdir;
 
-    #[test]
-    fn apply_selection_preserves_text() {
-        let spans = vec![Span::styled("hello world".to_string(), default_code_style())];
-        let selected = apply_selection(&spans, Some((3, 8)));
-        let rendered = selected.into_iter().map(|s| s.content.into_owned()).collect::<String>();
-        assert_eq!(rendered, "hello world");
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("main.rs"), "abcdef\n").unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.code_area = Rect { x: 10, y: 5, width: 80, height: 20 };
+
+        let point = app.mouse_point_to_text_point(10 + code_prefix_width() as u16 + 2, 5).unwrap();
+        assert_eq!(point, TextPoint { line: 0, column: 2 });
+        assert!(app.mouse_point_to_text_point(10 + code_prefix_width() as u16 + 2, 4).is_none());
     }
 
     #[test]
