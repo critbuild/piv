@@ -493,12 +493,22 @@ impl App {
         if self.remote_highlight.as_ref().is_some_and(|(_, _, _, at)| at.elapsed() >= HIGHLIGHT_FADE_DURATION) {
             self.remote_highlight = None;
         }
-        let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).split(f.area());
+        let searching = self.search_input.is_some();
+        let constraints = if searching {
+            vec![Constraint::Length(1), Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)]
+        } else {
+            vec![Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]
+        };
+        let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(f.area());
         self.tab_area = chunks[0];
         self.code_area = chunks[1];
         self.render_tabs(f, chunks[0]);
         self.render_code(f, chunks[1]);
-        self.render_status(f, chunks[2]);
+        let (prompt_idx, status_idx) = if searching { (2, 3) } else { (1, 2) };
+        if searching {
+            self.render_search_prompt(f, chunks[prompt_idx]);
+        }
+        self.render_status(f, chunks[status_idx]);
     }
 
     fn render_tabs(&self, f: &mut Frame, area: Rect) {
@@ -575,17 +585,17 @@ impl App {
             }).collect::<Vec<_>>()
         };
         f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL)), area);
-        if let Some(buffer) = &self.search_input {
-            let query = SearchQuery::new(buffer);
-            let count = if query.is_empty() { None } else { Some(self.current_search_matches(&query).len()) };
-            let cursor = if buffer.is_empty() { ' ' } else { ' ' };
-            let label = match count {
-                Some(n) => format!("/{buffer}{cursor}[{n}]"),
-                None => format!("/{buffer}{cursor}"),
-            };
-            let prompt_area = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: 1 };
-            f.render_widget(Paragraph::new(Span::styled(label, Style::default().fg(Color::Yellow))), prompt_area);
-        }
+    }
+
+    fn render_search_prompt(&self, f: &mut Frame, area: Rect) {
+        let Some(buffer) = &self.search_input else { return; };
+        let query = SearchQuery::new(buffer);
+        let count = if query.is_empty() { None } else { Some(self.current_search_matches(&query).len()) };
+        let label = match count {
+            Some(n) => format!("/{buffer} [{n}]"),
+            None => format!("/{buffer}"),
+        };
+        f.render_widget(Paragraph::new(Span::styled(label, Style::default().fg(Color::Yellow))), area);
     }
 
     fn render_status(&self, f: &mut Frame, area: Rect) {
