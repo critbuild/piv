@@ -7,7 +7,7 @@ use ratatui::{backend::CrosstermBackend, layout::{Constraint, Direction, Layout,
 use similar::TextDiff;
 use walkdir::WalkDir;
 
-use crate::{control::{ControlCommand, ControlServer}, diff::{DiffEngine, LineKind}, highlight::{default_code_style, Highlighter}, model::{PreparedRow, Selection, Tab, TabHit, TabManager, TextPoint}, watcher::{FileWatcher, IgnorePolicy, WatchEvent}};
+use crate::{control::{ControlCommand, ControlServer}, diff::{DiffEngine, LineKind}, highlight::{default_code_style, Highlighter}, model::{PreparedRow, Selection, Tab, TabHit, TabManager, TextPoint}, search::{Match as SearchMatch, SearchQuery}, watcher::{FileWatcher, IgnorePolicy, WatchEvent}};
 
 use arboard::Clipboard;
 
@@ -18,6 +18,8 @@ const FALLBACK_SCAN_INTERVAL: Duration = Duration::from_millis(750);
 const FALLBACK_SCAN_IDLE_DELAY: Duration = Duration::from_millis(1200);
 const GIT_REF_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const HIGHLIGHT_FADE_DURATION: Duration = Duration::from_secs(10);
+const SEARCH_MATCH_BG: (u8, u8, u8) = (96, 74, 30);
+const SEARCH_CURRENT_BG: (u8, u8, u8) = (180, 138, 40);
 const AUTO_FOCUS_TOP_PADDING: usize = 2;
 const ASSUMED_EDITOR_BG: (u8, u8, u8) = (0x17, 0x23, 0x27);
 const AI_HIGHLIGHT_BG: (u8, u8, u8) = (78, 72, 110);
@@ -67,6 +69,14 @@ pub struct App {
     diff_base: DiffBase,
     last_git_ref_probe: Instant,
     last_seen_diff_base_rev: Option<String>,
+    search_input: Option<String>,
+    last_search: Option<CommittedSearch>,
+}
+
+struct CommittedSearch {
+    path: PathBuf,
+    matches: Vec<SearchMatch>,
+    current: usize,
 }
 
 impl App {
@@ -98,6 +108,8 @@ impl App {
             diff_base: DiffBase::Head,
             last_git_ref_probe: Instant::now(),
             last_seen_diff_base_rev: None,
+            search_input: None,
+            last_search: None,
         };
         app.last_seen_diff_base_rev = app.current_diff_base_rev();
         app.seed_seen_mtimes()?;
@@ -176,8 +188,8 @@ impl App {
             ControlCommand::Open { path, line } => self.open_path(path, line)?,
             ControlCommand::Highlight { path, start_line, end_line } => self.highlight_path(path, start_line, end_line)?,
             ControlCommand::Line(line) => self.focus_current_line(line),
-            ControlCommand::TabNext => self.tabs.next(),
-            ControlCommand::TabPrev => self.tabs.prev(),
+            ControlCommand::TabNext => { self.tabs.next(); self.invalidate_search(); }
+            ControlCommand::TabPrev => { self.tabs.prev(); self.invalidate_search(); }
             ControlCommand::Recenter => if let Some(tab) = self.tabs.current_mut() { tab.auto_center = true; },
         }
         Ok(())
@@ -205,6 +217,7 @@ impl App {
     }
 
     fn remove_file(&mut self, path: &Path, at: SystemTime) {
+        self.invalidate_search();
         self.snapshots.remove(path);
         self.seen_mtimes.remove(path);
         self.tabs.remove(path);
@@ -212,6 +225,7 @@ impl App {
     }
 
     fn open_path(&mut self, path: PathBuf, line: Option<usize>) -> Result<()> {
+        self.invalidate_search();
         let path = if path.is_absolute() { path } else { self.root.join(path) };
         let path = path.canonicalize().with_context(|| format!("open target does not exist: {}", path.display()))?;
         let content = fs::read_to_string(&path).unwrap_or_else(|_| "<binary or unreadable file>".into());
@@ -272,6 +286,7 @@ impl App {
     }
 
     fn load_change(&mut self, path: PathBuf, at: SystemTime) -> Result<()> {
+        self.invalidate_search();
         let content = fs::read_to_string(&path).unwrap_or_else(|_| "<binary or unreadable file>".into());
         let old_snapshot = self.snapshots.get(&path).cloned().unwrap_or_else(|| content.clone());
         let diff = self.diff_for_path(&path, &content);
@@ -371,10 +386,20 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if self.search_input.is_some() {
+            // While the `/` prompt is open, keys feed the search buffer.
+            // Ctrl-C / q still quit so the user is never trapped.
+            if matches!((key.code, key.modifiers), (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Char('q'), _)) { return true; }
+            self.handle_search_input(key);
+            return false;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return true,
-            (KeyCode::Tab, _) => self.tabs.next(),
-            (KeyCode::BackTab, _) => self.tabs.prev(),
+            (KeyCode::Char('/'), _) => self.begin_search(),
+            (KeyCode::Char('n'), _) => self.cycle_search(true),
+            (KeyCode::Char('N'), KeyModifiers::SHIFT) => self.cycle_search(false),
+            (KeyCode::Tab, _) => { self.tabs.next(); self.invalidate_search(); }
+            (KeyCode::BackTab, _) => { self.tabs.prev(); self.invalidate_search(); }
             (KeyCode::Up, _) => self.scroll_up(1),
             (KeyCode::Down, _) => self.scroll_down(1),
             (KeyCode::PageUp, _) => self.scroll_up(20),
@@ -396,11 +421,14 @@ impl App {
             MouseEventKind::ScrollDown => self.scroll_down(MOUSE_SCROLL_LINES),
             MouseEventKind::Down(MouseButton::Left) => {
                 if rect_contains(self.tab_area, mouse.column, mouse.row) {
+                    let before = self.tabs.active;
+                    let before_len = self.tabs.len();
                     match self.tabs.tab_hit_at_column(mouse.column.saturating_sub(self.tab_area.x)) {
                         Some(TabHit::Select(index)) => self.tabs.select(index),
                         Some(TabHit::Close(index)) => self.tabs.remove_at(index),
                         None => {}
                     }
+                    if self.tabs.active != before || self.tabs.len() != before_len { self.invalidate_search(); }
                     self.mouse_selecting = false;
                 } else if let Some(point) = self.mouse_point_to_text_point(mouse.column, mouse.row) {
                     if let Some(tab) = self.tabs.current_mut() {
@@ -507,16 +535,20 @@ impl App {
         let height = area.height.saturating_sub(2) as usize;
         let highlight_style = self.remote_highlight.as_ref().and_then(|(_, _, _, at)| highlight_line_style(*at));
         let selection_active = tab.selection.is_some();
-        let static_only = !selection_active && highlight_style.is_none();
+        let search = self.last_search.as_ref().filter(|s| s.path == tab.path);
+        let search_active = search.is_some();
+        let static_only = !selection_active && !search_active && highlight_style.is_none();
         let lines = if static_only {
             cached_static_viewport_lines(tab, height)
         } else {
+            let current_match = search.and_then(|s| s.matches.get(s.current));
             tab.diff.iter().zip(tab.prepared_rows.iter()).enumerate().skip(tab.scroll).take(height).map(|(idx, (dl, row))| {
                 let line_highlighted = self.remote_highlight.as_ref().is_some_and(|(path, start_line, end_line, _)| {
                     path == &tab.path
                         && row.new_line_no.is_some_and(|line| ((start_line + 1)..=(end_line + 1)).contains(&line))
                 });
-                if !selection_active && !line_highlighted {
+                let line_matches: Vec<&SearchMatch> = search.map(|s| s.matches.iter().filter(|m| m.line == idx).collect()).unwrap_or_default();
+                if !selection_active && !line_highlighted && line_matches.is_empty() {
                     return row.static_line.clone();
                 }
                 let mark = match row.kind { LineKind::Added => "+", LineKind::Removed => "-", LineKind::Unchanged => " " };
@@ -535,11 +567,25 @@ impl App {
                         code_spans = apply_style_range(&code_spans, row.leading_ws, row.text_len, style);
                     }
                 }
+                if !line_matches.is_empty() {
+                    code_spans = apply_search_matches(&code_spans, &line_matches, current_match);
+                }
                 spans.extend(code_spans);
                 Line::from(spans)
             }).collect::<Vec<_>>()
         };
         f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL)), area);
+        if let Some(buffer) = &self.search_input {
+            let query = SearchQuery::new(buffer);
+            let count = if query.is_empty() { None } else { Some(self.current_search_matches(&query).len()) };
+            let cursor = if buffer.is_empty() { ' ' } else { ' ' };
+            let label = match count {
+                Some(n) => format!("/{buffer}{cursor}[{n}]"),
+                None => format!("/{buffer}{cursor}"),
+            };
+            let prompt_area = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: 1 };
+            f.render_widget(Paragraph::new(Span::styled(label, Style::default().fg(Color::Yellow))), prompt_area);
+        }
     }
 
     fn render_status(&self, f: &mut Frame, area: Rect) {
@@ -562,6 +608,7 @@ impl App {
     }
 
     fn refresh_open_tab_diffs(&mut self) {
+        self.invalidate_search();
         let updates = self.tabs.tabs.iter().map(|tab| {
             let diff = match self.reference_content(&tab.path) {
                 Some(old) => DiffEngine::diff(&old, &tab.content),
@@ -788,8 +835,96 @@ fn highlight_line_style(started_at: Instant) -> Option<Style> {
     )))
 }
 fn removed_line_style() -> Style { Style::default().bg(Color::Rgb(92, 48, 48)) }
+fn search_match_style() -> Style { Style::default().bg(Color::Rgb(SEARCH_MATCH_BG.0, SEARCH_MATCH_BG.1, SEARCH_MATCH_BG.2)) }
+fn search_current_style() -> Style { Style::default().bg(Color::Rgb(SEARCH_CURRENT_BG.0, SEARCH_CURRENT_BG.1, SEARCH_CURRENT_BG.2)).add_modifier(Modifier::BOLD) }
+
+fn apply_search_matches(spans: &[Span<'static>], line_matches: &[&SearchMatch], current: Option<&SearchMatch>) -> Vec<Span<'static>> {
+    // Apply right-to-left so earlier character offsets stay valid as we split spans.
+    let mut out = spans.to_vec();
+    for m in line_matches.iter().rev() {
+        let is_current = current.is_some_and(|c| c.line == m.line && c.column == m.column);
+        let style = if is_current { search_current_style() } else { search_match_style() };
+        out = apply_style_range(&out, m.column, m.end, style);
+    }
+    out
+}
 
 impl App {
+    fn begin_search(&mut self) {
+        self.search_input = Some(String::new());
+    }
+
+    fn invalidate_search(&mut self) {
+        // Matches index into a tab's diff by line; any tab identity/content
+        // change makes them stale, so drop the state rather than mis-highlight.
+        self.last_search = None;
+        self.search_input = None;
+    }
+
+    fn handle_search_input(&mut self, key: KeyEvent) {
+        let Some(buffer) = self.search_input.as_mut() else { return; };
+        match (key.code, key.modifiers) {
+            (KeyCode::Enter, _) => {
+                let query_text = std::mem::take(buffer);
+                self.commit_search(query_text);
+            }
+            (KeyCode::Esc, _) => { self.search_input = None; }
+            (KeyCode::Backspace, _) => { buffer.pop(); }
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => { buffer.push(c); }
+            _ => {}
+        }
+    }
+
+    fn commit_search(&mut self, text: String) {
+        self.search_input = None;
+        let query = SearchQuery::new(&text);
+        if query.is_empty() { self.last_search = None; return; }
+        let Some(tab) = self.tabs.current() else { self.last_search = None; return; };
+        let path = tab.path.clone();
+        let matches = self.current_search_matches(&query);
+        if matches.is_empty() { self.last_search = None; return; }
+        let current = self.starting_match_index(&matches);
+        if let Some(tab) = self.tabs.current_mut() { tab.selection = None; }
+        self.last_search = Some(CommittedSearch { path, matches, current });
+        self.jump_to_current_match();
+    }
+
+    fn cycle_search(&mut self, forward: bool) {
+        let Some(search) = self.last_search.as_mut() else { return; };
+        if search.matches.is_empty() { return; }
+        search.current = if forward {
+            crate::search::next_match(&search.matches, Some(search.current)).unwrap_or(0)
+        } else {
+            crate::search::prev_match(&search.matches, Some(search.current)).unwrap_or(0)
+        };
+        self.jump_to_current_match();
+    }
+
+    fn jump_to_current_match(&mut self) {
+        let Some(search) = self.last_search.as_ref() else { return; };
+        let Some(m) = search.matches.get(search.current) else { return; };
+        if let Some(tab) = self.tabs.current_mut() {
+            tab.focus_line = Some(m.line);
+            tab.auto_center = true;
+        }
+    }
+
+    fn current_search_matches(&self, query: &SearchQuery) -> Vec<SearchMatch> {
+        let Some(tab) = self.tabs.current() else { return Vec::new(); };
+        query.find(tab.diff.iter().enumerate().map(|(i, dl)| (i, dl.text.as_str())))
+    }
+
+    /// Start at the first match at or after the viewport center, else the first match.
+    fn starting_match_index(&self, matches: &[SearchMatch]) -> usize {
+        let height = self.viewport_height();
+        let Some(tab) = self.tabs.current() else { return 0; };
+        let from = tab.scroll + AUTO_FOCUS_TOP_PADDING.min(height.saturating_sub(1));
+        for (i, m) in matches.iter().enumerate() {
+            if m.line >= from { return i; }
+        }
+        0
+    }
+
     fn copy_selection_to_clipboard(&mut self) {
         let Some(tab) = self.tabs.current() else { return; };
         let Some(selection) = tab.selection else { return; };
@@ -947,6 +1082,48 @@ mod tests {
         assert_eq!(next_diff_center(&diff, Some(8), true), None);
         assert_eq!(next_diff_center(&diff, Some(8), false), Some(5));
         assert_eq!(next_diff_center(&diff, Some(5), false), Some(1));
+    }
+
+    #[test]
+    fn search_commits_and_cycles_through_matches() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("main.rs");
+        fs::write(&path, "alpha beta\nbeta gamma\ngamma delta\n").unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.commit_search("beta".to_string());
+        let search = app.last_search.as_ref().expect("search committed");
+        assert_eq!(search.matches.len(), 2);
+        assert_eq!(search.matches[0].line, 0);
+        assert_eq!(search.matches[1].line, 1);
+        // first jump goes to the match at/after the top center
+        assert_eq!(app.tabs.current().unwrap().focus_line, Some(0));
+
+        app.cycle_search(true);
+        assert_eq!(app.last_search.as_ref().unwrap().current, 1);
+        assert_eq!(app.tabs.current().unwrap().focus_line, Some(1));
+
+        app.cycle_search(true);
+        assert_eq!(app.last_search.as_ref().unwrap().current, 0);
+    }
+
+    #[test]
+    fn search_is_case_insensitive_for_lowercase_query() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("main.rs");
+        fs::write(&path, "Hello hello HELLO\n").unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.commit_search("hello".to_string());
+        assert_eq!(app.last_search.as_ref().unwrap().matches.len(), 3);
     }
 
     #[test]

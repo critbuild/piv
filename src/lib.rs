@@ -4,5 +4,6 @@ pub mod control;
 pub mod diff;
 pub mod highlight;
 pub mod model;
+pub mod search;
 pub mod ui;
 pub mod watcher;
