@@ -83,6 +83,9 @@ impl IgnorePolicy {
         if rel.components().any(|c| is_ignored_component(&c.as_os_str().to_string_lossy())) {
             return false;
         }
+        if is_ignored_extension(rel) {
+            return false;
+        }
         if let Some(gi) = &self.gitignore {
             if gi.matched(path, path.is_dir()).is_ignore() { return false; }
         }
@@ -109,6 +112,12 @@ fn is_ignored_component(component: &str) -> bool {
             | ".venv"
             | "venv"
     ) || component.ends_with(".egg-info")
+}
+
+fn is_ignored_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
 }
 
 #[cfg(test)]
@@ -186,5 +195,15 @@ mod tests {
             assert!(!policy.allows(&root.join(rel)), "expected {rel} to be ignored");
         }
         assert!(policy.allows(&root.join("src/main.py")));
+    }
+
+    #[test]
+    fn ignore_policy_filters_pdfs() {
+        let root = PathBuf::from("/tmp/project");
+        let policy = IgnorePolicy::new(&root);
+
+        assert!(!policy.allows(&root.join("docs/spec.pdf")));
+        assert!(!policy.allows(&root.join("docs/spec.PDF")));
+        assert!(policy.allows(&root.join("docs/spec.md")));
     }
 }
