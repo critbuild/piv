@@ -14,6 +14,18 @@ Shared domain language for product, PRDs, ADRs, and architecture reviews.
 
 **Control socket** — the Unix socket derived from the Watched root. It receives newline-delimited Remote control commands.
 
+**Tracker registry** — piv-owned SQLite data store for projects, PRDs, issues, PRD/issue links, issue order, blocker edges, and audit events.
+
+**Tracker socket** — local Unix socket for newline-delimited JSON-RPC tracker requests. It is independent of the Viewer so AI agents can read or update the tracker without the TUI running.
+
+**Project** — explicit tracker object with a stable key, display name, and optional roots/sources. Projects are created through the tracker API rather than inferred only from the Watched root.
+
+**PRD** — product requirements document record in the Tracker registry. A PRD has a stable project-scoped key, title, status, optional body/source URI, and ordered linked Issues.
+
+**Issue** — implementation work item linked to one or more PRDs. Issues have a stable key, status, body, explicit per-PRD order, and optional blocker Issues.
+
+**Blocker** — issue dependency edge where one Issue cannot be next until its blocker Issues are complete or canceled. Blocked state is derived, not a stored status.
+
 ## Code viewing
 
 **Tab** — one open file in the Viewer. A Tab carries file content, highlighted lines, diff rows, viewport position, focus, selection, and last edit time.
@@ -24,13 +36,15 @@ Shared domain language for product, PRDs, ADRs, and architecture reviews.
 
 **Status line** — the bottom row showing active file, diff base, line/change counts, copy notice, and transient highlight status.
 
-**Command line** — the one-row prompt above the Status line used for interactive commands such as `/` search.
+**Command line** — the one-row prompt above the Status line used for interactive commands such as `/` search or `:prd` tracker entry.
 
 **Viewport** — the visible slice of the active Tab’s prepared diff rows.
 
 **Focus line** — the diff row piv wants to bring into view after a change, jump, search, or Remote control command.
 
 **Selection** — a mouse-drag text range in the Code pane that is copied on mouse release.
+
+**Tracker mode** — full-screen `:prd` view that renders Projects, expandable PRDs, and ordered Issues from the Tracker registry.
 
 ## Change and diff model
 

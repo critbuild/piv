@@ -1,6 +1,6 @@
 # Architecture
 
-Last reviewed: 2026-07-02
+Last reviewed: 2026-07-04
 
 Read first:
 
@@ -9,21 +9,25 @@ Read first:
 
 ## Current Module map
 
-- `src/main.rs` — process entry point. Chooses Watch mode vs Remote control mode and starts the TUI.
-- `src/cli.rs` — CLI parsing, target parsing, and Control socket path derivation.
+- `src/main.rs` — process entry point. Chooses Watch mode, Remote control mode, or tracker socket/client modes.
+- `src/cli.rs` — CLI parsing, target parsing, Control socket path derivation, and tracker socket flags.
 - `src/control.rs` — Control socket server/client and Remote control text protocol.
 - `src/code_pane.rs` — Code pane Prepared row creation, viewport line rendering, gutter formatting, static viewport caching, and Style overlay composition.
 - `src/watcher.rs` — filesystem Watch event intake and Ignore policy.
+- `src/file_intake.rs` — Snapshot/mtime bookkeeping, initial-file selection, fallback scan comparison, content loading, and Tab construction for file intake intents.
 - `src/diff.rs` — old/new content to Diff rows.
 - `src/highlight.rs` — tree-sitter syntax highlighting with plain-text fallback.
 - `src/search.rs` — in-file Search query matching and match cycling.
+- `src/tracker.rs` — SQLite-backed Tracker registry, schema migration, project/PRD/issue/blocker domain operations, status transitions, backfill, and snapshots.
+- `src/tracker_rpc.rs` — JSON-RPC tracker adapter, default tracker socket path, one-shot client, and independent tracker socket server.
+- `src/tracker_ui.rs` — pure Tracker mode view state, row visibility, expansion IDs, and project/PRD/issue row rendering.
 - `src/model.rs` — Tab, TabManager, Selection, Prepared row, and viewport cache data.
 - `src/ui.rs` — terminal setup/teardown wrapper.
-- `src/app.rs` — Viewer orchestration: event loop, file intake, Git Diff base lookup, Tab lifecycle, input handling, rendering, Style overlays, clipboard integration, search state, and many helper functions/tests.
+- `src/app.rs` — Viewer orchestration: event loop, File intake delegation, Git Diff base lookup, Tab lifecycle, input handling, rendering, Style overlays, clipboard integration, search state, and many helper functions/tests.
 
 ## Architecture notes
 
-Externally, `App` is a deep Module: callers only need `App::new(root)` and `App::run(terminal)` to get a full Viewer. Internally, `src/app.rs` has accumulated many concepts. That is not automatically bad, but it makes local reasoning harder because change intake, input mode, Git reference lookup, and Tab invariants are all edited in one file. Code pane row rendering has now been deepened into `src/code_pane.rs`.
+Externally, `App` is a deep Module: callers only need `App::new(root)` and `App::run(terminal)` to get a full Viewer. Internally, `src/app.rs` has accumulated many concepts. That is not automatically bad, but it makes local reasoning harder because input mode, Git reference lookup, tracker mode wiring, and Tab invariants are still edited in one file. Code pane row rendering has been deepened into `src/code_pane.rs`, file intake has been deepened into `src/file_intake.rs`, and tracker data/API/UI row logic lives behind dedicated tracker Modules.
 
 The best near-term architecture work should keep the external Viewer Interface small while introducing internal Modules that improve Locality and testability.
 
@@ -43,13 +47,15 @@ The best near-term architecture work should keep the external Viewer Interface s
 
 ### 2. Deepen the File intake Module
 
-**Files** — `src/app.rs`, `src/watcher.rs`, `src/diff.rs`, `src/highlight.rs`, `src/model.rs`.
+**Status** — Shipped in `docs/prd/2026-07-03-file-intake-seam.md`.
 
-**Problem** — The Viewer currently handles Watch events, Fallback scan mtimes, removals, snapshots, initial-file selection, content reads, diff creation, syntax highlighting, focus-line choice, and Tab insertion. The same load path is nearly repeated for `open_path` and `load_change`, with subtle differences around Snapshot updates and focus selection.
+**Files** — `src/file_intake.rs`, `src/app.rs`, `src/watcher.rs`, `src/diff.rs`, `src/highlight.rs`, `src/model.rs`.
 
-**Solution** — Create an internal Module around File intake that turns paths plus intent (`initial`, `watch changed`, `remote open`, `removed`) into Tab updates or removals. The Module should own Snapshot/mtime bookkeeping and focus selection policy.
+**Problem** — The Viewer handled Watch events, Fallback scan mtimes, removals, snapshots, initial-file selection, content reads, diff creation, syntax highlighting, focus-line choice, and Tab insertion. The same load path was nearly repeated for `open_path` and `load_change`, with subtle differences around Snapshot updates and focus selection.
 
-**Benefits** — Locality improves for filesystem race and missed-event bugs. Leverage improves because Watch events, Fallback scans, and Remote control opens can share one tested path for producing Tab state.
+**Solution** — Concentrated File intake behind `src/file_intake.rs`. The Module owns Snapshot/mtime bookkeeping, newest-file selection, fallback scan comparison, content loading, Tab construction, Remote-open Snapshot preservation, changed-file Snapshot updates, and focus-line policy. `App` still owns Git Diff base policy and passes reference content into intake.
+
+**Benefits** — Locality improved for filesystem race and missed-event bugs. Leverage improved because Watch events, Fallback scans, and Remote control opens now share tested Tab-producing logic while preserving intent-specific Snapshot behavior.
 
 ### 3. Deepen the Git Diff base Module
 
@@ -83,7 +89,6 @@ The best near-term architecture work should keep the external Viewer Interface s
 
 ## Suggested exploration order
 
-1. File intake Module — reduces duplication and makes watcher/fallback behavior easier to test.
-2. Tab lifecycle Module — smaller refactor that supports both rendering and intake work.
-3. Git Diff base Module — valuable, but only after File intake boundaries are clearer.
-4. Interaction mode Module — useful once rendering and Tab lifecycle have firmer seams.
+1. Tab lifecycle Module — smaller refactor that supports both rendering and intake work.
+2. Git Diff base Module — valuable now that File intake accepts reference content from `App`.
+3. Interaction mode Module — useful once rendering and Tab lifecycle have firmer seams.

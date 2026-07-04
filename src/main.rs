@@ -1,5 +1,11 @@
 use anyhow::{Context, Result};
-use piv::{app::App, cli::{parse_cli_mode, CliMode}, control::send_control_command, ui::run_tui};
+use piv::{
+    app::App,
+    cli::{CliMode, parse_cli_mode},
+    control::send_control_command,
+    tracker_rpc::{send_tracker_rpc_request, serve_tracker_rpc},
+    ui::run_tui,
+};
 
 fn main() -> Result<()> {
     // Dispatch: local watch mode vs remote control command.
@@ -11,6 +17,11 @@ fn main() -> Result<()> {
         CliMode::Remote { root, command } => {
             let root = root.canonicalize().context("control root must exist")?;
             send_control_command(&root, &command)
+        }
+        CliMode::TrackerServe { socket, db } => serve_tracker_rpc(&socket, &db),
+        CliMode::TrackerRpc { socket, request } => {
+            println!("{}", send_tracker_rpc_request(&socket, &request)?);
+            Ok(())
         }
     }
 }

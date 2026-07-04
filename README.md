@@ -15,6 +15,9 @@ It watches a project directory for file changes, opens changed files in tabs, hi
 - clickable tabs
 - mouse text selection
 - remote open, jump, and highlight commands
+- SQLite-backed PRD/issue tracker for AI-registered plans
+- full-screen `:prd` tracker UI with ordered issues and blockers
+- JSON-RPC tracker socket for agents and future MCP tools
 
 ## Run
 
@@ -52,16 +55,34 @@ From another directory:
 piv --root /path/to/project --open src/main.rs:120
 ```
 
+## PRD tracker
+
+Start the tracker socket independently of the TUI:
+
+```sh
+piv --tracker-serve
+```
+
+Send a JSON-RPC request to the tracker socket:
+
+```sh
+piv --tracker-rpc '{"jsonrpc":"2.0","id":"1","method":"project.list","params":{}}'
+```
+
+Register plans with `project.create` and `prd.upsert_plan`; read work with `prd.list`, `issue.list`, `issue.next`, or `tracker.snapshot`. The registry lives in SQLite at `$XDG_DATA_HOME/piv/tracker.sqlite` or `~/.local/share/piv/tracker.sqlite`.
+
 ## Controls
 
 - `Tab` and `Shift-Tab` switch tabs
 - arrow keys and page keys scroll
 - `[` and `]` jump between diff hunks
 - `/` opens in-file search, `Enter` commits, `Esc` cancels
+- `:` opens command mode; `:prd` opens the full-screen PRD tracker
 - `n` and `N` cycle search matches
 - `\` toggles diff base between `HEAD` and `origin/main`
 - `c` re-center
 - `q` or `Ctrl-C` quit
+- in `:prd`: `j/k` move, `h/l` collapse/expand, `Enter` toggles, `Space` cycles issue status, `p` cycles PRD status, `q`/`Esc` exits tracker
 - mouse wheel scrolls
 - click tab row to switch tabs
 - drag in code pane to select text

@@ -1,13 +1,45 @@
-use std::{collections::HashMap, fs, io::Write, path::{Path, PathBuf}, process::{Child, Command, Stdio}, sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError}, time::{Duration, Instant, SystemTime}};
+use std::{
+    collections::HashMap,
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+    time::{Duration, Instant, SystemTime},
+};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use chrono::{DateTime, Local};
-use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::{backend::CrosstermBackend, layout::{Constraint, Direction, Layout, Rect}, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::Paragraph, Frame, Terminal};
-use similar::TextDiff;
-use walkdir::WalkDir;
+use crossterm::event::{
+    self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
+};
 
-use crate::{code_pane::{code_prefix_width, prepare_rows, render_code_pane, CodePaneOverlays, RemoteHighlightOverlay, SearchOverlay}, control::{ControlCommand, ControlServer}, diff::{DiffEngine, LineKind}, highlight::Highlighter, model::{Selection, Tab, TabHit, TabManager, TextPoint}, search::{Match as SearchMatch, SearchQuery}, watcher::{FileWatcher, IgnorePolicy, WatchEvent}};
+use crate::{
+    code_pane::{
+        CodePaneOverlays, RemoteHighlightOverlay, SearchOverlay, code_prefix_width, prepare_rows,
+        render_code_pane,
+    },
+    control::{ControlCommand, ControlServer},
+    diff::{DiffEngine, LineKind},
+    file_intake::{FileIntake, row_index_for_new_line},
+    highlight::Highlighter,
+    model::{Selection, Tab, TabHit, TabManager, TextPoint},
+    search::{Match as SearchMatch, SearchQuery},
+    tracker::TrackerStore,
+    tracker_ui::{
+        TrackerItemRef, TrackerViewState, max_tracker_detail_scroll, render_tracker_view_lines,
+        visible_items,
+    },
+    watcher::{FileWatcher, WatchEvent},
+};
 
 use arboard::Clipboard;
 
@@ -51,9 +83,7 @@ pub struct App {
     _watcher: FileWatcher,
     _control_server: ControlServer,
     tabs: TabManager,
-    snapshots: HashMap<PathBuf, String>,
-    seen_mtimes: HashMap<PathBuf, SystemTime>,
-    last_fallback_scan: Instant,
+    intake: FileIntake,
     highlighter: Highlighter,
     clipboard: Option<Clipboard>,
     clipboard_process: Option<Child>,
@@ -69,12 +99,23 @@ pub struct App {
     last_seen_diff_base_rev: Option<String>,
     search_input: Option<String>,
     last_search: Option<CommittedSearch>,
+    mode: InteractionMode,
+    tracker: Option<TrackerStore>,
+    tracker_view: TrackerViewState,
+    tracker_notice: Option<String>,
 }
 
 struct CommittedSearch {
     path: PathBuf,
     matches: Vec<SearchMatch>,
     current: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InteractionMode {
+    Code,
+    Command(String),
+    Tracker,
 }
 
 impl App {
@@ -84,15 +125,13 @@ impl App {
         let (command_tx, command_rx) = mpsc::channel();
         let control_server = ControlServer::start(&root, command_tx)?;
         let mut app = Self {
-            root,
+            root: root.clone(),
             rx,
             command_rx,
             _watcher: watcher,
             _control_server: control_server,
             tabs: TabManager::new(MAX_TABS),
-            snapshots: HashMap::new(),
-            seen_mtimes: HashMap::new(),
-            last_fallback_scan: Instant::now(),
+            intake: FileIntake::new(root.clone()),
             highlighter: Highlighter::new()?,
             clipboard: Clipboard::new().ok(),
             clipboard_process: None,
@@ -108,6 +147,10 @@ impl App {
             last_seen_diff_base_rev: None,
             search_input: None,
             last_search: None,
+            mode: InteractionMode::Code,
+            tracker: None,
+            tracker_view: TrackerViewState::default(),
+            tracker_notice: None,
         };
         app.last_seen_diff_base_rev = app.current_diff_base_rev();
         app.seed_seen_mtimes()?;
@@ -116,28 +159,20 @@ impl App {
     }
 
     fn open_initial_file(&mut self) -> Result<()> {
-        let policy = IgnorePolicy::new(&self.root);
-        let newest = WalkDir::new(&self.root).into_iter().filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file() && policy.allows(e.path()))
-            .filter_map(|e| e.metadata().ok().and_then(|m| m.modified().ok().map(|t| (e.path().to_path_buf(), t))))
-            .max_by_key(|(_, t)| *t);
-        if let Some((path, at)) = newest { self.load_change(path, at)?; }
+        if let Some((path, at)) = self.intake.newest_allowed_file() {
+            self.load_change(path, at)?;
+        }
         Ok(())
     }
 
     fn seed_seen_mtimes(&mut self) -> Result<()> {
-        let policy = IgnorePolicy::new(&self.root);
-        self.seen_mtimes = WalkDir::new(&self.root)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file() && policy.allows(e.path()))
-            .filter_map(|e| e.metadata().ok().and_then(|m| m.modified().ok().map(|t| (e.path().to_path_buf(), t))))
-            .collect();
-        self.last_fallback_scan = Instant::now();
-        Ok(())
+        self.intake.seed_seen_mtimes()
     }
 
-    pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+    pub fn run(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
         let mut should_draw = true;
         loop {
             if should_draw {
@@ -145,12 +180,24 @@ impl App {
                 should_draw = false;
             }
 
-            if self.drain_file_changes()? { should_draw = true; }
-            if self.scan_for_missed_changes()? { should_draw = true; }
-            if self.scan_for_git_ref_changes() { should_draw = true; }
-            if self.drain_control_commands()? { should_draw = true; }
+            if self.drain_file_changes()? {
+                should_draw = true;
+            }
+            if self.scan_for_missed_changes()? {
+                should_draw = true;
+            }
+            if self.scan_for_git_ref_changes() {
+                should_draw = true;
+            }
+            if self.drain_control_commands()? {
+                should_draw = true;
+            }
 
-            let timeout = if self.remote_highlight.is_some() { Duration::from_millis(33) } else { Duration::from_millis(250) };
+            let timeout = if self.remote_highlight.is_some() {
+                Duration::from_millis(33)
+            } else {
+                Duration::from_millis(250)
+            };
             if event::poll(timeout)? {
                 should_draw = true;
                 self.last_input_at = Instant::now();
@@ -184,66 +231,102 @@ impl App {
     fn handle_control_command(&mut self, command: ControlCommand) -> Result<()> {
         match command {
             ControlCommand::Open { path, line } => self.open_path(path, line)?,
-            ControlCommand::Highlight { path, start_line, end_line } => self.highlight_path(path, start_line, end_line)?,
+            ControlCommand::Highlight {
+                path,
+                start_line,
+                end_line,
+            } => self.highlight_path(path, start_line, end_line)?,
             ControlCommand::Line(line) => self.focus_current_line(line),
-            ControlCommand::TabNext => { self.tabs.next(); self.invalidate_search(); }
-            ControlCommand::TabPrev => { self.tabs.prev(); self.invalidate_search(); }
-            ControlCommand::Recenter => if let Some(tab) = self.tabs.current_mut() { tab.auto_center = true; },
+            ControlCommand::TabNext => {
+                self.tabs.next();
+                self.invalidate_search();
+            }
+            ControlCommand::TabPrev => {
+                self.tabs.prev();
+                self.invalidate_search();
+            }
+            ControlCommand::Recenter => {
+                if let Some(tab) = self.tabs.current_mut() {
+                    tab.auto_center = true;
+                }
+            }
         }
         Ok(())
     }
 
     fn drain_file_changes(&mut self) -> Result<bool> {
-        let first = match self.rx.try_recv() { Ok(c) => c, Err(_) => return Ok(false) };
+        let first = match self.rx.try_recv() {
+            Ok(c) => c,
+            Err(_) => return Ok(false),
+        };
         let mut changed: HashMap<PathBuf, SystemTime> = HashMap::new();
         let mut removed: Vec<(PathBuf, SystemTime)> = Vec::new();
         match first {
-            WatchEvent::Changed { path, at } => { changed.insert(path, at); }
-            WatchEvent::Removed { path, at } => { removed.push((path, at)); }
+            WatchEvent::Changed { path, at } => {
+                changed.insert(path, at);
+            }
+            WatchEvent::Removed { path, at } => {
+                removed.push((path, at));
+            }
         }
         let deadline = Instant::now() + BATCH_WINDOW;
         while Instant::now() < deadline {
             match self.rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(WatchEvent::Changed { path, at }) => { changed.insert(path, at); }
-                Ok(WatchEvent::Removed { path, at }) => { removed.push((path, at)); }
+                Ok(WatchEvent::Changed { path, at }) => {
+                    changed.insert(path, at);
+                }
+                Ok(WatchEvent::Removed { path, at }) => {
+                    removed.push((path, at));
+                }
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
             }
         }
-        for (path, at) in removed { self.remove_file(&path, at); }
-        for (path, at) in changed { self.load_change(path, at)?; }
+        for (path, at) in removed {
+            self.remove_file(&path, at);
+        }
+        for (path, at) in changed {
+            self.load_change(path, at)?;
+        }
         Ok(true)
     }
 
     fn remove_file(&mut self, path: &Path, at: SystemTime) {
         self.invalidate_search();
-        self.snapshots.remove(path);
-        self.seen_mtimes.remove(path);
+        self.intake.remove(path);
         self.tabs.remove(path);
         self.last_change = Some(at);
     }
 
     fn open_path(&mut self, path: PathBuf, line: Option<usize>) -> Result<()> {
         self.invalidate_search();
-        let path = if path.is_absolute() { path } else { self.root.join(path) };
-        let path = path.canonicalize().with_context(|| format!("open target does not exist: {}", path.display()))?;
-        let content = fs::read_to_string(&path).unwrap_or_else(|_| "<binary or unreadable file>".into());
-        let diff = self.diff_for_path(&path, &content);
-        let highlighted_lines = self.highlighter.highlight_lines(&path, &content);
-        let prepared_rows = prepare_rows(&diff, &highlighted_lines);
-        let first_change = diff.iter().position(|l| l.kind != LineKind::Unchanged);
-        self.snapshots.entry(path.clone()).or_insert_with(|| content.clone());
-        let focus_line = line.and_then(|line| row_index_for_new_line(&diff, line.saturating_sub(1))).or(first_change);
-        let tab = Tab { path, content, highlighted_lines, diff, prepared_rows, viewport_cache: None, first_change, focus_line, center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
-        self.last_change = Some(SystemTime::now());
+        let path = self
+            .intake
+            .resolve_existing_path(path, "open target does not exist")?;
+        let reference_content = self.reference_content(&path);
+        let at = SystemTime::now();
+        let tab =
+            self.intake
+                .load_remote_open(path, line, at, &self.highlighter, reference_content)?;
+        self.last_change = Some(at);
         self.tabs.add_or_bring_to_front(tab);
         Ok(())
     }
 
     fn highlight_path(&mut self, path: PathBuf, start_line: usize, end_line: usize) -> Result<()> {
-        let path = if path.is_absolute() { path } else { self.root.join(path) };
-        let path = path.canonicalize().with_context(|| format!("highlight target does not exist: {}", path.display()))?;
-        let (start_line, end_line) = if start_line <= end_line { (start_line, end_line) } else { (end_line, start_line) };
-        self.remote_highlight = Some((path.clone(), start_line.saturating_sub(1), end_line.saturating_sub(1), Instant::now()));
+        let path = self
+            .intake
+            .resolve_existing_path(path, "highlight target does not exist")?;
+        let (start_line, end_line) = if start_line <= end_line {
+            (start_line, end_line)
+        } else {
+            (end_line, start_line)
+        };
+        self.remote_highlight = Some((
+            path.clone(),
+            start_line.saturating_sub(1),
+            end_line.saturating_sub(1),
+            Instant::now(),
+        ));
         self.open_path(path, Some(start_line))
     }
 
@@ -256,58 +339,30 @@ impl App {
     }
 
     fn scan_for_missed_changes(&mut self) -> Result<bool> {
-        if self.last_fallback_scan.elapsed() < FALLBACK_SCAN_INTERVAL { return Ok(false); }
-        if self.last_input_at.elapsed() < FALLBACK_SCAN_IDLE_DELAY { return Ok(false); }
-        self.last_fallback_scan = Instant::now();
-
-        let policy = IgnorePolicy::new(&self.root);
-        let mut current = HashMap::new();
-        let mut changed = Vec::new();
-        for entry in WalkDir::new(&self.root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || !policy.allows(entry.path()) { continue; }
-            let Ok(metadata) = entry.metadata() else { continue; };
-            let Ok(modified) = metadata.modified() else { continue; };
-            let path = entry.path().to_path_buf();
-            current.insert(path.clone(), modified);
-            if self.seen_mtimes.get(&path).is_none_or(|old| *old < modified) {
-                changed.push((path, modified));
-            }
+        let missed = self.intake.scan_for_missed_changes(
+            self.last_input_at.elapsed(),
+            FALLBACK_SCAN_INTERVAL,
+            FALLBACK_SCAN_IDLE_DELAY,
+        )?;
+        let had_changes = !missed.is_empty();
+        for path in missed.removed {
+            self.remove_file(&path, SystemTime::now());
         }
-
-        let removed = self.seen_mtimes.keys().filter(|path| !current.contains_key(*path)).cloned().collect::<Vec<_>>();
-        self.seen_mtimes = current;
-
-        let had_changes = !removed.is_empty() || !changed.is_empty();
-        for path in removed { self.remove_file(&path, SystemTime::now()); }
-        for (path, at) in changed { self.load_change(path, at)?; }
+        for (path, at) in missed.changed {
+            self.load_change(path, at)?;
+        }
         Ok(had_changes)
     }
 
     fn load_change(&mut self, path: PathBuf, at: SystemTime) -> Result<()> {
         self.invalidate_search();
-        let content = fs::read_to_string(&path).unwrap_or_else(|_| "<binary or unreadable file>".into());
-        let old_snapshot = self.snapshots.get(&path).cloned().unwrap_or_else(|| content.clone());
-        let diff = self.diff_for_path(&path, &content);
-        let highlighted_lines = self.highlighter.highlight_lines(&path, &content);
-        let prepared_rows = prepare_rows(&diff, &highlighted_lines);
-        let first_change = diff.iter().position(|l| l.kind != LineKind::Unchanged);
-        let focus_line = latest_snapshot_change_line(&old_snapshot, &content)
-            .and_then(|line| row_index_for_new_line(&diff, line))
-            .or_else(|| diff.iter().rposition(|l| l.kind != LineKind::Unchanged));
-        self.snapshots.insert(path.clone(), content.clone());
-        self.seen_mtimes.insert(path.clone(), at);
-        let tab = Tab { path, content, highlighted_lines, diff, prepared_rows, viewport_cache: None, first_change, focus_line, center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: at };
+        let reference_content = self.reference_content(&path);
+        let tab = self
+            .intake
+            .load_changed(path, at, &self.highlighter, reference_content)?;
         self.last_change = Some(at);
         self.tabs.add_or_bring_to_front(tab);
         Ok(())
-    }
-
-    fn diff_for_path(&self, path: &Path, content: &str) -> Vec<crate::diff::DiffLine> {
-        if let Some(old) = self.reference_content(path) {
-            return DiffEngine::diff(&old, content);
-        }
-        let old = self.snapshots.get(path).map(String::as_str).unwrap_or("");
-        DiffEngine::diff(old, content)
     }
 
     fn reference_content(&self, path: &Path) -> Option<String> {
@@ -315,7 +370,10 @@ impl App {
             DiffBase::Head => self.git_ref_content("HEAD", path),
             DiffBase::OriginMain => {
                 if self.git_ref_exists("origin/main") {
-                    Some(self.git_ref_content("origin/main", path).unwrap_or_default())
+                    Some(
+                        self.git_ref_content("origin/main", path)
+                            .unwrap_or_default(),
+                    )
                 } else {
                     self.git_ref_content("HEAD", path)
                 }
@@ -325,7 +383,8 @@ impl App {
 
     fn git_ref_exists(&self, git_ref: &str) -> bool {
         Command::new("git")
-            .arg("-C").arg(&self.root)
+            .arg("-C")
+            .arg(&self.root)
             .args(["rev-parse", "--verify", "--quiet", git_ref])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -336,7 +395,8 @@ impl App {
     fn git_ref_content(&self, git_ref: &str, path: &Path) -> Option<String> {
         let rel = path.strip_prefix(&self.root).unwrap_or(path);
         let output = Command::new("git")
-            .arg("-C").arg(&self.root)
+            .arg("-C")
+            .arg(&self.root)
             .args(["show", &format!("{}:{}", git_ref, rel.display())])
             .output()
             .ok()?;
@@ -349,14 +409,21 @@ impl App {
     fn current_diff_base_rev(&self) -> Option<String> {
         let git_ref = match self.diff_base {
             DiffBase::Head => Some("HEAD"),
-            DiffBase::OriginMain => if self.git_ref_exists("origin/main") { Some("origin/main") } else { Some("HEAD") },
+            DiffBase::OriginMain => {
+                if self.git_ref_exists("origin/main") {
+                    Some("origin/main")
+                } else {
+                    Some("HEAD")
+                }
+            }
         }?;
         self.git_ref_oid(git_ref)
     }
 
     fn git_ref_oid(&self, git_ref: &str) -> Option<String> {
         let output = Command::new("git")
-            .arg("-C").arg(&self.root)
+            .arg("-C")
+            .arg(&self.root)
             .args(["rev-parse", "--verify", "--quiet", git_ref])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -384,36 +451,74 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if matches!((key.code, key.modifiers), (KeyCode::Char('c'), KeyModifiers::CONTROL)) {
+            return true;
+        }
+        match &self.mode {
+            InteractionMode::Tracker => {
+                self.handle_tracker_key(key);
+                return false;
+            }
+            InteractionMode::Command(_) => {
+                self.handle_command_input(key);
+                return false;
+            }
+            InteractionMode::Code => {}
+        }
         if self.search_input.is_some() {
             // While the `/` prompt is open, keys feed the search buffer.
             // Ctrl-C / q still quit so the user is never trapped.
-            if matches!((key.code, key.modifiers), (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Char('q'), _)) { return true; }
+            if matches!(
+                (key.code, key.modifiers),
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Char('q'), _)
+            ) {
+                return true;
+            }
             self.handle_search_input(key);
             return false;
         }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return true,
+            (KeyCode::Char(':'), _) | (KeyCode::Char(';'), KeyModifiers::SHIFT) => self.begin_command(),
             (KeyCode::Char('/'), _) => self.begin_search(),
             (KeyCode::Char('n'), _) => self.cycle_search(true),
             (KeyCode::Char('N'), KeyModifiers::SHIFT) => self.cycle_search(false),
-            (KeyCode::Tab, _) => { self.tabs.next(); self.invalidate_search(); }
-            (KeyCode::BackTab, _) => { self.tabs.prev(); self.invalidate_search(); }
+            (KeyCode::Tab, _) => {
+                self.tabs.next();
+                self.invalidate_search();
+            }
+            (KeyCode::BackTab, _) => {
+                self.tabs.prev();
+                self.invalidate_search();
+            }
             (KeyCode::Up, _) => self.scroll_up(1),
             (KeyCode::Down, _) => self.scroll_down(1),
             (KeyCode::PageUp, _) => self.scroll_up(20),
             (KeyCode::PageDown, _) => self.scroll_down(20),
             (KeyCode::Home, _) => self.set_scroll(0),
-            (KeyCode::End, _) => if let Some(t) = self.tabs.current() { self.set_scroll(t.diff.len().saturating_sub(1)); },
+            (KeyCode::End, _) => {
+                if let Some(t) = self.tabs.current() {
+                    self.set_scroll(t.diff.len().saturating_sub(1));
+                }
+            }
             (KeyCode::Char('['), _) => self.jump_to_diff(false),
             (KeyCode::Char(']'), _) => self.jump_to_diff(true),
             (KeyCode::Char('\\'), _) => self.toggle_diff_base(),
-            (KeyCode::Char('c'), _) => if let Some(t) = self.tabs.current_mut() { t.auto_center = true; },
+            (KeyCode::Char('c'), _) => {
+                if let Some(t) = self.tabs.current_mut() {
+                    t.auto_center = true;
+                }
+            }
             _ => {}
         }
         false
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.in_tracker_mode() {
+            self.handle_tracker_mouse(mouse);
+            return;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_up(MOUSE_SCROLL_LINES),
             MouseEventKind::ScrollDown => self.scroll_down(MOUSE_SCROLL_LINES),
@@ -421,16 +526,25 @@ impl App {
                 if rect_contains(self.tab_area, mouse.column, mouse.row) {
                     let before = self.tabs.active;
                     let before_len = self.tabs.len();
-                    match self.tabs.tab_hit_at_column(mouse.column.saturating_sub(self.tab_area.x)) {
+                    match self
+                        .tabs
+                        .tab_hit_at_column(mouse.column.saturating_sub(self.tab_area.x))
+                    {
                         Some(TabHit::Select(index)) => self.tabs.select(index),
                         Some(TabHit::Close(index)) => self.tabs.remove_at(index),
                         None => {}
                     }
-                    if self.tabs.active != before || self.tabs.len() != before_len { self.invalidate_search(); }
+                    if self.tabs.active != before || self.tabs.len() != before_len {
+                        self.invalidate_search();
+                    }
                     self.mouse_selecting = false;
-                } else if let Some(point) = self.mouse_point_to_text_point(mouse.column, mouse.row) {
+                } else if let Some(point) = self.mouse_point_to_text_point(mouse.column, mouse.row)
+                {
                     if let Some(tab) = self.tabs.current_mut() {
-                        tab.selection = Some(Selection { anchor: point, focus: point });
+                        tab.selection = Some(Selection {
+                            anchor: point,
+                            focus: point,
+                        });
                         tab.auto_center = false;
                     }
                     self.mouse_selecting = true;
@@ -440,7 +554,9 @@ impl App {
                 if self.mouse_selecting {
                     if let Some(point) = self.mouse_point_to_text_point(mouse.column, mouse.row) {
                         if let Some(tab) = self.tabs.current_mut() {
-                            if let Some(selection) = &mut tab.selection { selection.focus = point; }
+                            if let Some(selection) = &mut tab.selection {
+                                selection.focus = point;
+                            }
                         }
                     }
                 }
@@ -458,18 +574,50 @@ impl App {
         let inner_y = self.code_area.y;
         let inner_width = self.code_area.width;
         let inner_height = self.code_area.height;
-        if column < inner_x || row < inner_y || column >= inner_x.saturating_add(inner_width) || row >= inner_y.saturating_add(inner_height) { return None; }
+        if column < inner_x
+            || row < inner_y
+            || column >= inner_x.saturating_add(inner_width)
+            || row >= inner_y.saturating_add(inner_height)
+        {
+            return None;
+        }
         let line = self.tabs.current()?.scroll + usize::from(row.saturating_sub(inner_y));
         let text = self.tabs.current()?.diff.get(line)?.text.as_str();
         let visible_column = usize::from(column.saturating_sub(inner_x));
         let text_column = visible_column.saturating_sub(code_prefix_width());
-        Some(TextPoint { line, column: text_column.min(text.chars().count()) })
+        Some(TextPoint {
+            line,
+            column: text_column.min(text.chars().count()),
+        })
     }
 
-    fn viewport_height(&self) -> usize { self.code_area.height as usize }
-    fn set_scroll(&mut self, n: usize) { let h = self.viewport_height(); if let Some(t) = self.tabs.current_mut() { t.scroll = n; t.auto_center = false; clamp_tab_scroll(t, h); } }
-    fn scroll_up(&mut self, n: usize) { let h = self.viewport_height(); if let Some(t) = self.tabs.current_mut() { t.scroll = t.scroll.saturating_sub(n); t.auto_center = false; clamp_tab_scroll(t, h); } }
-    fn scroll_down(&mut self, n: usize) { let h = self.viewport_height(); if let Some(t) = self.tabs.current_mut() { t.scroll = (t.scroll + n).min(t.diff.len().saturating_sub(1)); t.auto_center = false; clamp_tab_scroll(t, h); } }
+    fn viewport_height(&self) -> usize {
+        self.code_area.height as usize
+    }
+    fn set_scroll(&mut self, n: usize) {
+        let h = self.viewport_height();
+        if let Some(t) = self.tabs.current_mut() {
+            t.scroll = n;
+            t.auto_center = false;
+            clamp_tab_scroll(t, h);
+        }
+    }
+    fn scroll_up(&mut self, n: usize) {
+        let h = self.viewport_height();
+        if let Some(t) = self.tabs.current_mut() {
+            t.scroll = t.scroll.saturating_sub(n);
+            t.auto_center = false;
+            clamp_tab_scroll(t, h);
+        }
+    }
+    fn scroll_down(&mut self, n: usize) {
+        let h = self.viewport_height();
+        if let Some(t) = self.tabs.current_mut() {
+            t.scroll = (t.scroll + n).min(t.diff.len().saturating_sub(1));
+            t.auto_center = false;
+            clamp_tab_scroll(t, h);
+        }
+    }
 
     fn jump_to_diff(&mut self, forward: bool) {
         let height = self.code_area.height.saturating_sub(2) as usize;
@@ -488,23 +636,46 @@ impl App {
     }
 
     fn render(&mut self, f: &mut Frame) {
-        if self.remote_highlight.as_ref().is_some_and(|(_, _, _, at)| at.elapsed() >= HIGHLIGHT_FADE_DURATION) {
+        if self
+            .remote_highlight
+            .as_ref()
+            .is_some_and(|(_, _, _, at)| at.elapsed() >= HIGHLIGHT_FADE_DURATION)
+        {
             self.remote_highlight = None;
         }
-        let searching = self.search_input.is_some();
-        let constraints = if searching {
-            vec![Constraint::Length(1), Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)]
+        if self.in_tracker_mode() {
+            self.render_tracker(f, f.area());
+            return;
+        }
+        let prompting =
+            self.search_input.is_some() || matches!(self.mode, InteractionMode::Command(_));
+        let constraints = if prompting {
+            vec![
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ]
         } else {
-            vec![Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]
+            vec![
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ]
         };
-        let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(f.area());
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(f.area());
         self.tab_area = chunks[0];
         self.code_area = chunks[1];
         self.render_tabs(f, chunks[0]);
         self.render_code(f, chunks[1]);
-        let (prompt_idx, status_idx) = if searching { (2, 3) } else { (1, 2) };
-        if searching {
+        let (prompt_idx, status_idx) = if prompting { (2, 3) } else { (1, 2) };
+        if self.search_input.is_some() {
             self.render_search_prompt(f, chunks[prompt_idx]);
+        } else if matches!(self.mode, InteractionMode::Command(_)) {
+            self.render_command_prompt(f, chunks[prompt_idx]);
         }
         self.render_status(f, chunks[status_idx]);
     }
@@ -513,13 +684,38 @@ impl App {
         let divider_style = Style::default().fg(Color::DarkGray);
         let mut spans = vec![Span::raw(" ")];
         spans.extend(self.tabs.tabs.iter().enumerate().flat_map(|(i, t)| {
-            let name = t.path.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+            let name = t
+                .path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
             let active = i == self.tabs.active;
-            let accent_style = if active { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) } else { divider_style };
-            let label_style = if active { Style::default().fg(Color::White).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Gray) };
-            let close_style = if active { Style::default().fg(Color::Rgb(220, 80, 80)).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Rgb(180, 40, 40)) };
+            let accent_style = if active {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                divider_style
+            };
+            let label_style = if active {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let close_style = if active {
+                Style::default()
+                    .fg(Color::Rgb(220, 80, 80))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(180, 40, 40))
+            };
             let mut parts = Vec::new();
-            if i > 0 { parts.push(Span::styled(" │ ", divider_style)); }
+            if i > 0 {
+                parts.push(Span::styled(" │ ", divider_style));
+            }
             parts.push(Span::styled(if active { "▌" } else { " " }, accent_style));
             parts.push(Span::styled(name, label_style));
             parts.push(Span::raw(" "));
@@ -532,7 +728,13 @@ impl App {
     fn render_code(&mut self, f: &mut Frame, area: Rect) {
         let height = area.height as usize;
         let Some(tab) = self.tabs.current_mut() else {
-            f.render_widget(Paragraph::new(Span::styled("No source files found yet. Waiting for changes...", Style::default().fg(Color::DarkGray))), area);
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "No source files found yet. Waiting for changes...",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                area,
+            );
             return;
         };
         center_tab(tab, height);
@@ -540,40 +742,158 @@ impl App {
             tab.center_diff = Some(center);
         }
 
-        let remote_highlight = self.remote_highlight.as_ref().and_then(|(path, start_line, end_line, at)| {
-            if path == &tab.path {
-                highlight_line_style(*at).map(|style| RemoteHighlightOverlay { start_line: *start_line, end_line: *end_line, style })
-            } else {
-                None
-            }
-        });
-        let search = self.last_search.as_ref()
+        let remote_highlight =
+            self.remote_highlight
+                .as_ref()
+                .and_then(|(path, start_line, end_line, at)| {
+                    if path == &tab.path {
+                        highlight_line_style(*at).map(|style| RemoteHighlightOverlay {
+                            start_line: *start_line,
+                            end_line: *end_line,
+                            style,
+                        })
+                    } else {
+                        None
+                    }
+                });
+        let search = self
+            .last_search
+            .as_ref()
             .filter(|search| search.path == tab.path)
-            .map(|search| SearchOverlay { matches: search.matches.as_slice(), current: search.current });
+            .map(|search| SearchOverlay {
+                matches: search.matches.as_slice(),
+                current: search.current,
+            });
         let selection = tab.selection;
-        let lines = render_code_pane(tab, height, CodePaneOverlays { selection, remote_highlight, search });
+        let lines = render_code_pane(
+            tab,
+            height,
+            CodePaneOverlays {
+                selection,
+                remote_highlight,
+                search,
+            },
+        );
         f.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_search_prompt(&self, f: &mut Frame, area: Rect) {
-        let Some(buffer) = &self.search_input else { return; };
+        let Some(buffer) = &self.search_input else {
+            return;
+        };
         let query = SearchQuery::new(buffer);
-        let count = if query.is_empty() { None } else { Some(self.current_search_matches(&query).len()) };
+        let count = if query.is_empty() {
+            None
+        } else {
+            Some(self.current_search_matches(&query).len())
+        };
         let label = match count {
             Some(n) => format!("/{buffer} [{n}]"),
             None => format!("/{buffer}"),
         };
-        f.render_widget(Paragraph::new(Span::styled(label, Style::default().fg(Color::Yellow))), area);
+        f.render_widget(
+            Paragraph::new(Span::styled(label, Style::default().fg(Color::Yellow))),
+            area,
+        );
+    }
+
+    fn render_command_prompt(&self, f: &mut Frame, area: Rect) {
+        let InteractionMode::Command(buffer) = &self.mode else {
+            return;
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!(":{buffer}"),
+                Style::default().fg(Color::Yellow),
+            )),
+            area,
+        );
+    }
+
+    fn render_tracker(&mut self, f: &mut Frame, area: Rect) {
+        let rows = match self
+            .tracker
+            .as_ref()
+            .and_then(|tracker| tracker.snapshot().ok())
+        {
+            Some(snapshot) => {
+                let max_scroll = max_tracker_detail_scroll(
+                    &snapshot,
+                    &self.tracker_view,
+                    area.width as usize,
+                    area.height as usize,
+                );
+                self.tracker_view.clamp_detail_scroll(max_scroll);
+                render_tracker_view_lines(
+                    &snapshot,
+                    &self.tracker_view,
+                    area.width as usize,
+                    area.height as usize,
+                )
+            },
+            None => vec![
+                Line::raw("PRD Tracker                                      :prd"),
+                Line::raw(""),
+                Line::raw(
+                    self.tracker_notice
+                        .clone()
+                        .unwrap_or_else(|| "Tracker database unavailable.".to_string()),
+                ),
+            ],
+        };
+        f.render_widget(Paragraph::new(rows), area);
     }
 
     fn render_status(&self, f: &mut Frame, area: Rect) {
-        let copied = self.copy_notice_until.is_some_and(|until| until > Instant::now());
+        let copied = self
+            .copy_notice_until
+            .is_some_and(|until| until > Instant::now());
         let text = if let Some(tab) = self.tabs.current() {
-            let rel = tab.path.strip_prefix(&self.root).unwrap_or(&tab.path).display();
-            let changes = tab.diff.iter().filter(|l| l.kind != LineKind::Unchanged).count();
+            let rel = tab
+                .path
+                .strip_prefix(&self.root)
+                .unwrap_or(&tab.path)
+                .display();
+            let changes = tab
+                .diff
+                .iter()
+                .filter(|l| l.kind != LineKind::Unchanged)
+                .count();
             let ts: DateTime<Local> = tab.last_edit.into();
-            format!("{} | diff {} | {} lines | {} changes | tab {}/{} | last edit {} | {}{}{}", rel, self.diff_base.label(), tab.content.lines().count(), changes, self.tabs.active + 1, self.tabs.len(), ts.format("%H:%M:%S"), if self.last_change.is_some() { "idle" } else { "waiting" }, if copied { " | copied" } else { "" }, match self.remote_highlight.as_ref() { Some((path, start_line, end_line, at)) if path == &tab.path && at.elapsed() < HIGHLIGHT_FADE_DURATION => if start_line == end_line { format!(" | hl {}", start_line + 1) } else { format!(" | hl {}-{}", start_line + 1, end_line + 1) }, _ => String::new(), })
-        } else { format!("watching {} | diff {} | idle{}", self.root.display(), self.diff_base.label(), if copied { " | copied" } else { "" }) };
+            format!(
+                "{} | diff {} | {} lines | {} changes | tab {}/{} | last edit {} | {}{}{}",
+                rel,
+                self.diff_base.label(),
+                tab.content.lines().count(),
+                changes,
+                self.tabs.active + 1,
+                self.tabs.len(),
+                ts.format("%H:%M:%S"),
+                if self.last_change.is_some() {
+                    "idle"
+                } else {
+                    "waiting"
+                },
+                if copied { " | copied" } else { "" },
+                match self.remote_highlight.as_ref() {
+                    Some((path, start_line, end_line, at))
+                        if path == &tab.path && at.elapsed() < HIGHLIGHT_FADE_DURATION =>
+                        if start_line == end_line {
+                            format!(" | hl {}", start_line + 1)
+                        } else {
+                            format!(" | hl {}-{}", start_line + 1, end_line + 1)
+                        },
+                    _ => String::new(),
+                }
+            )
+        } else {
+            format!(
+                "watching {} | diff {} | idle{}",
+                self.root.display(),
+                self.diff_base.label(),
+                if copied { " | copied" } else { "" }
+            )
+        };
         f.render_widget(Paragraph::new(text), area);
     }
 }
@@ -587,18 +907,23 @@ impl App {
 
     fn refresh_open_tab_diffs(&mut self) {
         self.invalidate_search();
-        let updates = self.tabs.tabs.iter().map(|tab| {
-            let diff = match self.reference_content(&tab.path) {
-                Some(old) => DiffEngine::diff(&old, &tab.content),
-                None => {
-                    let old = self.snapshots.get(&tab.path).map(String::as_str).unwrap_or("");
-                    DiffEngine::diff(old, &tab.content)
-                }
-            };
-            let first_change = diff.iter().position(|l| l.kind != LineKind::Unchanged);
-            let prepared_rows = prepare_rows(&diff, &tab.highlighted_lines);
-            (diff, prepared_rows, first_change)
-        }).collect::<Vec<_>>();
+        let updates = self
+            .tabs
+            .tabs
+            .iter()
+            .map(|tab| {
+                let diff = match self.reference_content(&tab.path) {
+                    Some(old) => DiffEngine::diff(&old, &tab.content),
+                    None => {
+                        let old = self.intake.snapshot(&tab.path).unwrap_or("");
+                        DiffEngine::diff(old, &tab.content)
+                    }
+                };
+                let first_change = diff.iter().position(|l| l.kind != LineKind::Unchanged);
+                let prepared_rows = prepare_rows(&diff, &tab.highlighted_lines);
+                (diff, prepared_rows, first_change)
+            })
+            .collect::<Vec<_>>();
 
         for (tab, (diff, prepared_rows, first_change)) in self.tabs.tabs.iter_mut().zip(updates) {
             tab.prepared_rows = prepared_rows;
@@ -647,10 +972,18 @@ fn diff_hunks(diff: &[crate::diff::DiffLine]) -> Vec<(usize, usize)> {
     hunks
 }
 
-fn hunk_anchor(start: usize, _end: usize) -> usize { start }
+fn hunk_anchor(start: usize, _end: usize) -> usize {
+    start
+}
 
-fn visible_diff_center(diff: &[crate::diff::DiffLine], scroll: usize, height: usize) -> Option<usize> {
-    if height == 0 { return None; }
+fn visible_diff_center(
+    diff: &[crate::diff::DiffLine],
+    scroll: usize,
+    height: usize,
+) -> Option<usize> {
+    if height == 0 {
+        return None;
+    }
     let viewport_end = scroll + height.saturating_sub(1);
     let viewport_target = scroll + AUTO_FOCUS_TOP_PADDING.min(height.saturating_sub(1));
     diff_hunks(diff)
@@ -660,8 +993,15 @@ fn visible_diff_center(diff: &[crate::diff::DiffLine], scroll: usize, height: us
         .min_by_key(|anchor| anchor.abs_diff(viewport_target))
 }
 
-fn next_diff_center(diff: &[crate::diff::DiffLine], current: Option<usize>, forward: bool) -> Option<usize> {
-    let anchors = diff_hunks(diff).into_iter().map(|(start, end)| hunk_anchor(start, end)).collect::<Vec<_>>();
+fn next_diff_center(
+    diff: &[crate::diff::DiffLine],
+    current: Option<usize>,
+    forward: bool,
+) -> Option<usize> {
+    let anchors = diff_hunks(diff)
+        .into_iter()
+        .map(|(start, end)| hunk_anchor(start, end))
+        .collect::<Vec<_>>();
     match (current, forward) {
         (Some(current), true) => anchors.into_iter().find(|anchor| *anchor > current),
         (Some(current), false) => anchors.into_iter().rev().find(|anchor| *anchor < current),
@@ -671,14 +1011,23 @@ fn next_diff_center(diff: &[crate::diff::DiffLine], current: Option<usize>, forw
 }
 
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
-    column >= rect.x && row >= rect.y && column < rect.x.saturating_add(rect.width) && row < rect.y.saturating_add(rect.height)
+    column >= rect.x
+        && row >= rect.y
+        && column < rect.x.saturating_add(rect.width)
+        && row < rect.y.saturating_add(rect.height)
 }
 
 fn highlight_line_style(started_at: Instant) -> Option<Style> {
     let elapsed = started_at.elapsed();
-    if elapsed >= HIGHLIGHT_FADE_DURATION { return None; }
+    if elapsed >= HIGHLIGHT_FADE_DURATION {
+        return None;
+    }
     let remain = 1.0 - (elapsed.as_secs_f32() / HIGHLIGHT_FADE_DURATION.as_secs_f32());
-    let blend = |from: u8, to: u8| ((to as f32) + ((from as f32) - (to as f32)) * remain).round().clamp(0.0, 255.0) as u8;
+    let blend = |from: u8, to: u8| {
+        ((to as f32) + ((from as f32) - (to as f32)) * remain)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
     Some(Style::default().bg(Color::Rgb(
         blend(AI_HIGHLIGHT_BG.0, ASSUMED_EDITOR_BG.0),
         blend(AI_HIGHLIGHT_BG.1, ASSUMED_EDITOR_BG.1),
@@ -686,6 +1035,215 @@ fn highlight_line_style(started_at: Instant) -> Option<Style> {
     )))
 }
 impl App {
+    fn begin_command(&mut self) {
+        self.mode = InteractionMode::Command(String::new());
+    }
+
+    fn handle_command_input(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Enter, _) => {
+                let command = match std::mem::replace(&mut self.mode, InteractionMode::Code) {
+                    InteractionMode::Command(command) => command,
+                    other => {
+                        self.mode = other;
+                        return;
+                    }
+                };
+                self.commit_command(command);
+            }
+            (KeyCode::Esc, _) => {
+                self.mode = InteractionMode::Code;
+            }
+            (KeyCode::Backspace, _) => {
+                if let InteractionMode::Command(buffer) = &mut self.mode {
+                    buffer.pop();
+                }
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                if let InteractionMode::Command(buffer) = &mut self.mode {
+                    buffer.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn commit_command(&mut self, command: String) {
+        match command.trim() {
+            "prd" => self.enter_tracker_mode(),
+            "" => {
+                self.mode = InteractionMode::Code;
+            }
+            other => {
+                self.tracker_notice = Some(format!("unknown command: {other}"));
+                self.mode = InteractionMode::Code;
+            }
+        }
+    }
+
+    fn enter_tracker_mode(&mut self) {
+        if self.tracker.is_none() {
+            match TrackerStore::open_default() {
+                Ok(store) => self.tracker = Some(store),
+                Err(error) => self.tracker_notice = Some(format!("tracker unavailable: {error}")),
+            }
+        }
+        self.mode = InteractionMode::Tracker;
+    }
+
+    fn in_tracker_mode(&self) -> bool {
+        matches!(self.mode, InteractionMode::Tracker)
+    }
+
+    fn handle_tracker_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => self.mode = InteractionMode::Code,
+            (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
+                if let Some(snapshot) = self.tracker_snapshot() {
+                    self.tracker_view.move_down(&snapshot);
+                }
+            }
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.tracker_view.move_up(),
+            (KeyCode::PageDown, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                self.tracker_view.scroll_detail_down(10)
+            }
+            (KeyCode::PageUp, _) | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                self.tracker_view.scroll_detail_up(10)
+            }
+            (KeyCode::Home, _) => self.tracker_view.reset_detail_scroll(),
+            (KeyCode::End, _) => self.tracker_view.scroll_detail_down(usize::MAX / 2),
+            (KeyCode::Char('l'), _) | (KeyCode::Enter, _) => self.toggle_selected_tracker_row(),
+            (KeyCode::Char('h'), _) => self.collapse_selected_tracker_row(),
+            (KeyCode::Char(' '), _) => self.cycle_selected_issue_status(),
+            (KeyCode::Char('p'), _) => self.cycle_selected_prd_status(),
+            _ => {}
+        }
+    }
+
+    fn handle_tracker_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.tracker_view.scroll_detail_up(MOUSE_SCROLL_LINES),
+            MouseEventKind::ScrollDown => self.tracker_view.scroll_detail_down(MOUSE_SCROLL_LINES),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(snapshot) = self.tracker_snapshot() else {
+                    return;
+                };
+                let row = usize::from(mouse.row).saturating_sub(2);
+                let item_count = visible_items(&snapshot, &self.tracker_view).len();
+                if row < item_count {
+                    if self.tracker_view.selected != row {
+                        self.tracker_view.selected = row;
+                        self.tracker_view.reset_detail_scroll();
+                    }
+                    self.toggle_selected_tracker_row();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn tracker_snapshot(&self) -> Option<crate::tracker::TrackerSnapshot> {
+        self.tracker
+            .as_ref()
+            .and_then(|tracker| tracker.snapshot().ok())
+    }
+
+    fn selected_tracker_item(&self) -> Option<TrackerItemRef> {
+        let snapshot = self.tracker_snapshot()?;
+        self.tracker_view.selected_item(&snapshot)
+    }
+
+    fn toggle_selected_tracker_row(&mut self) {
+        match self.selected_tracker_item() {
+            Some(TrackerItemRef::Project { project_key }) => {
+                self.tracker_view.toggle(&format!("project:{project_key}"))
+            }
+            Some(TrackerItemRef::Prd {
+                project_key,
+                prd_key,
+            }) => self
+                .tracker_view
+                .toggle(&format!("prd:{project_key}/{prd_key}")),
+            Some(TrackerItemRef::Issue { .. }) | None => {}
+        }
+    }
+
+    fn collapse_selected_tracker_row(&mut self) {
+        match self.selected_tracker_item() {
+            Some(TrackerItemRef::Project { project_key }) => self
+                .tracker_view
+                .collapse(&format!("project:{project_key}")),
+            Some(TrackerItemRef::Prd {
+                project_key,
+                prd_key,
+            }) => self
+                .tracker_view
+                .collapse(&format!("prd:{project_key}/{prd_key}")),
+            Some(TrackerItemRef::Issue { .. }) | None => {}
+        }
+    }
+
+    fn cycle_selected_issue_status(&mut self) {
+        let Some(TrackerItemRef::Issue {
+            project_key,
+            issue_key,
+            ..
+        }) = self.selected_tracker_item()
+        else {
+            return;
+        };
+        let Some(snapshot) = self.tracker_snapshot() else {
+            return;
+        };
+        let Some(status) = snapshot
+            .projects
+            .iter()
+            .find(|project| project.project.key == project_key)
+            .and_then(|project| {
+                project
+                    .prds
+                    .iter()
+                    .flat_map(|prd| prd.issues.iter())
+                    .find(|issue| issue.key == issue_key)
+            })
+            .map(|issue| issue.status.cycle())
+        else {
+            return;
+        };
+        if let Some(tracker) = self.tracker.as_mut() {
+            if let Err(error) = tracker.set_issue_status(&project_key, &issue_key, status) {
+                self.tracker_notice = Some(error.to_string());
+            }
+        }
+    }
+
+    fn cycle_selected_prd_status(&mut self) {
+        let Some(TrackerItemRef::Prd {
+            project_key,
+            prd_key,
+        }) = self.selected_tracker_item()
+        else {
+            return;
+        };
+        let Some(snapshot) = self.tracker_snapshot() else {
+            return;
+        };
+        let Some(status) = snapshot
+            .projects
+            .iter()
+            .find(|project| project.project.key == project_key)
+            .and_then(|project| project.prds.iter().find(|prd| prd.prd.key == prd_key))
+            .map(|prd| prd.prd.status.cycle())
+        else {
+            return;
+        };
+        if let Some(tracker) = self.tracker.as_mut() {
+            if let Err(error) = tracker.set_prd_status(&project_key, &prd_key, status) {
+                self.tracker_notice = Some(error.to_string());
+            }
+        }
+    }
+
     fn begin_search(&mut self) {
         self.search_input = Some(String::new());
     }
@@ -698,15 +1256,23 @@ impl App {
     }
 
     fn handle_search_input(&mut self, key: KeyEvent) {
-        let Some(buffer) = self.search_input.as_mut() else { return; };
+        let Some(buffer) = self.search_input.as_mut() else {
+            return;
+        };
         match (key.code, key.modifiers) {
             (KeyCode::Enter, _) => {
                 let query_text = std::mem::take(buffer);
                 self.commit_search(query_text);
             }
-            (KeyCode::Esc, _) => { self.search_input = None; }
-            (KeyCode::Backspace, _) => { buffer.pop(); }
-            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => { buffer.push(c); }
+            (KeyCode::Esc, _) => {
+                self.search_input = None;
+            }
+            (KeyCode::Backspace, _) => {
+                buffer.pop();
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                buffer.push(c);
+            }
             _ => {}
         }
     }
@@ -714,20 +1280,39 @@ impl App {
     fn commit_search(&mut self, text: String) {
         self.search_input = None;
         let query = SearchQuery::new(&text);
-        if query.is_empty() { self.last_search = None; return; }
-        let Some(tab) = self.tabs.current() else { self.last_search = None; return; };
+        if query.is_empty() {
+            self.last_search = None;
+            return;
+        }
+        let Some(tab) = self.tabs.current() else {
+            self.last_search = None;
+            return;
+        };
         let path = tab.path.clone();
         let matches = self.current_search_matches(&query);
-        if matches.is_empty() { self.last_search = None; return; }
+        if matches.is_empty() {
+            self.last_search = None;
+            return;
+        }
         let current = self.starting_match_index(&matches);
-        if let Some(tab) = self.tabs.current_mut() { tab.selection = None; }
-        self.last_search = Some(CommittedSearch { path, matches, current });
+        if let Some(tab) = self.tabs.current_mut() {
+            tab.selection = None;
+        }
+        self.last_search = Some(CommittedSearch {
+            path,
+            matches,
+            current,
+        });
         self.jump_to_current_match();
     }
 
     fn cycle_search(&mut self, forward: bool) {
-        let Some(search) = self.last_search.as_mut() else { return; };
-        if search.matches.is_empty() { return; }
+        let Some(search) = self.last_search.as_mut() else {
+            return;
+        };
+        if search.matches.is_empty() {
+            return;
+        }
         search.current = if forward {
             crate::search::next_match(&search.matches, Some(search.current)).unwrap_or(0)
         } else {
@@ -737,8 +1322,12 @@ impl App {
     }
 
     fn jump_to_current_match(&mut self) {
-        let Some(search) = self.last_search.as_ref() else { return; };
-        let Some(m) = search.matches.get(search.current) else { return; };
+        let Some(search) = self.last_search.as_ref() else {
+            return;
+        };
+        let Some(m) = search.matches.get(search.current) else {
+            return;
+        };
         if let Some(tab) = self.tabs.current_mut() {
             tab.focus_line = Some(m.line);
             tab.auto_center = true;
@@ -746,25 +1335,42 @@ impl App {
     }
 
     fn current_search_matches(&self, query: &SearchQuery) -> Vec<SearchMatch> {
-        let Some(tab) = self.tabs.current() else { return Vec::new(); };
-        query.find(tab.diff.iter().enumerate().map(|(i, dl)| (i, dl.text.as_str())))
+        let Some(tab) = self.tabs.current() else {
+            return Vec::new();
+        };
+        query.find(
+            tab.diff
+                .iter()
+                .enumerate()
+                .map(|(i, dl)| (i, dl.text.as_str())),
+        )
     }
 
     /// Start at the first match at or after the viewport center, else the first match.
     fn starting_match_index(&self, matches: &[SearchMatch]) -> usize {
         let height = self.viewport_height();
-        let Some(tab) = self.tabs.current() else { return 0; };
+        let Some(tab) = self.tabs.current() else {
+            return 0;
+        };
         let from = tab.scroll + AUTO_FOCUS_TOP_PADDING.min(height.saturating_sub(1));
         for (i, m) in matches.iter().enumerate() {
-            if m.line >= from { return i; }
+            if m.line >= from {
+                return i;
+            }
         }
         0
     }
 
     fn copy_selection_to_clipboard(&mut self) {
-        let Some(tab) = self.tabs.current() else { return; };
-        let Some(selection) = tab.selection else { return; };
-        let Some(text) = selected_text(&tab.diff, selection) else { return; };
+        let Some(tab) = self.tabs.current() else {
+            return;
+        };
+        let Some(selection) = tab.selection else {
+            return;
+        };
+        let Some(text) = selected_text(&tab.diff, selection) else {
+            return;
+        };
         if self.write_clipboard(&text).is_ok() {
             if let Some(tab) = self.tabs.current_mut() {
                 tab.selection = None;
@@ -822,48 +1428,42 @@ impl App {
 }
 
 fn selected_text(lines: &[crate::diff::DiffLine], selection: Selection) -> Option<String> {
-    let (start, end) = if selection.anchor <= selection.focus { (selection.anchor, selection.focus) } else { (selection.focus, selection.anchor) };
+    let (start, end) = if selection.anchor <= selection.focus {
+        (selection.anchor, selection.focus)
+    } else {
+        (selection.focus, selection.anchor)
+    };
     let mut out = String::new();
     for (idx, line) in lines.iter().enumerate() {
-        if idx < start.line || idx > end.line { continue; }
+        if idx < start.line || idx > end.line {
+            continue;
+        }
         let chars: Vec<char> = line.text.chars().collect();
-        let line_start = if idx == start.line { start.column.min(chars.len()) } else { 0 };
-        let line_end = if idx == end.line { end.column.min(chars.len()) } else { chars.len() };
+        let line_start = if idx == start.line {
+            start.column.min(chars.len())
+        } else {
+            0
+        };
+        let line_end = if idx == end.line {
+            end.column.min(chars.len())
+        } else {
+            chars.len()
+        };
         if line_start < line_end {
             out.push_str(&chars[line_start..line_end].iter().collect::<String>());
         }
-        if idx != end.line { out.push('\n'); }
+        if idx != end.line {
+            out.push('\n');
+        }
     }
     Some(out)
 }
 
-fn row_index_for_new_line(diff: &[crate::diff::DiffLine], line: usize) -> Option<usize> {
-    diff.iter().position(|dl| dl.new_line_no == Some(line + 1))
-}
-
-fn latest_snapshot_change_line(old: &str, new: &str) -> Option<usize> {
-    let diff = TextDiff::from_lines(old, new);
-    for op in diff.ops().iter().rev() {
-        match op.tag() {
-            similar::DiffTag::Insert | similar::DiffTag::Replace => {
-                if op.new_range().len() > 0 {
-                    return Some(op.new_range().end.saturating_sub(1));
-                }
-            }
-            similar::DiffTag::Delete => {
-                return Some(op.new_range().start.saturating_sub(1));
-            }
-            similar::DiffTag::Equal => {}
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, time::SystemTime};
     use super::*;
     use crate::watcher::IgnorePolicy;
+    use std::{path::Path, time::SystemTime};
 
     #[test]
     fn diff_marks_added_lines() {
@@ -873,7 +1473,10 @@ mod tests {
 
     #[test]
     fn diff_replace_renders_removed_then_added_lines() {
-        let lines = DiffEngine::diff("old comment\n", "haiku line one\nhaiku line two\nhaiku line three\n");
+        let lines = DiffEngine::diff(
+            "old comment\n",
+            "haiku line one\nhaiku line two\nhaiku line three\n",
+        );
         assert_eq!(lines[0].kind, LineKind::Removed);
         assert_eq!(lines[1].kind, LineKind::Added);
         assert_eq!(lines[2].kind, LineKind::Added);
@@ -883,15 +1486,60 @@ mod tests {
     #[test]
     fn visible_diff_center_tracks_hunk_near_top_of_screen() {
         let diff = vec![
-            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(1), new_line_no: Some(1), text: "a".into() },
-            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(2), text: "b".into() },
-            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(3), text: "c".into() },
-            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(4), new_line_no: Some(4), text: "d".into() },
-            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(5), new_line_no: Some(5), text: "e".into() },
-            crate::diff::DiffLine { kind: LineKind::Removed, old_line_no: Some(6), new_line_no: None, text: "f".into() },
-            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(6), text: "F".into() },
-            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(7), new_line_no: Some(7), text: "g".into() },
-            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(8), text: "h".into() },
+            crate::diff::DiffLine {
+                kind: LineKind::Unchanged,
+                old_line_no: Some(1),
+                new_line_no: Some(1),
+                text: "a".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Added,
+                old_line_no: None,
+                new_line_no: Some(2),
+                text: "b".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Added,
+                old_line_no: None,
+                new_line_no: Some(3),
+                text: "c".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Unchanged,
+                old_line_no: Some(4),
+                new_line_no: Some(4),
+                text: "d".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Unchanged,
+                old_line_no: Some(5),
+                new_line_no: Some(5),
+                text: "e".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Removed,
+                old_line_no: Some(6),
+                new_line_no: None,
+                text: "f".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Added,
+                old_line_no: None,
+                new_line_no: Some(6),
+                text: "F".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Unchanged,
+                old_line_no: Some(7),
+                new_line_no: Some(7),
+                text: "g".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Added,
+                old_line_no: None,
+                new_line_no: Some(8),
+                text: "h".into(),
+            },
         ];
         assert_eq!(visible_diff_center(&diff, 0, 4), Some(1));
         assert_eq!(visible_diff_center(&diff, 4, 3), Some(5));
@@ -901,15 +1549,60 @@ mod tests {
     #[test]
     fn next_diff_center_moves_between_hunk_starts() {
         let diff = vec![
-            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(1), new_line_no: Some(1), text: "a".into() },
-            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(2), text: "b".into() },
-            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(3), text: "c".into() },
-            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(4), new_line_no: Some(4), text: "d".into() },
-            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(5), new_line_no: Some(5), text: "e".into() },
-            crate::diff::DiffLine { kind: LineKind::Removed, old_line_no: Some(6), new_line_no: None, text: "f".into() },
-            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(6), text: "F".into() },
-            crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(7), new_line_no: Some(7), text: "g".into() },
-            crate::diff::DiffLine { kind: LineKind::Added, old_line_no: None, new_line_no: Some(8), text: "h".into() },
+            crate::diff::DiffLine {
+                kind: LineKind::Unchanged,
+                old_line_no: Some(1),
+                new_line_no: Some(1),
+                text: "a".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Added,
+                old_line_no: None,
+                new_line_no: Some(2),
+                text: "b".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Added,
+                old_line_no: None,
+                new_line_no: Some(3),
+                text: "c".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Unchanged,
+                old_line_no: Some(4),
+                new_line_no: Some(4),
+                text: "d".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Unchanged,
+                old_line_no: Some(5),
+                new_line_no: Some(5),
+                text: "e".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Removed,
+                old_line_no: Some(6),
+                new_line_no: None,
+                text: "f".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Added,
+                old_line_no: None,
+                new_line_no: Some(6),
+                text: "F".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Unchanged,
+                old_line_no: Some(7),
+                new_line_no: Some(7),
+                text: "g".into(),
+            },
+            crate::diff::DiffLine {
+                kind: LineKind::Added,
+                old_line_no: None,
+                new_line_no: Some(8),
+                text: "h".into(),
+            },
         ];
         assert_eq!(next_diff_center(&diff, None, true), Some(1));
         assert_eq!(next_diff_center(&diff, Some(1), true), Some(5));
@@ -917,6 +1610,114 @@ mod tests {
         assert_eq!(next_diff_center(&diff, Some(8), true), None);
         assert_eq!(next_diff_center(&diff, Some(8), false), Some(5));
         assert_eq!(next_diff_center(&diff, Some(5), false), Some(1));
+    }
+
+    #[test]
+    fn colon_prd_command_enters_tracker_mode() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        assert!(!app.in_tracker_mode());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.in_tracker_mode());
+    }
+
+    #[test]
+    fn shifted_semicolon_prd_command_enters_tracker_mode() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char(';'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.in_tracker_mode());
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_tracker_mode() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.enter_tracker_mode();
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn tracker_page_keys_scroll_detail_pane() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.enter_tracker_mode();
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(app.tracker_view.detail_scroll > 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.tracker_view.detail_scroll, 0);
+    }
+
+    #[test]
+    fn tracker_mouse_wheel_scrolls_detail_without_moving_menu_selection() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.enter_tracker_mode();
+        let selected = app.tracker_view.selected;
+
+        app.handle_tracker_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.tracker_view.selected, selected);
+        assert!(app.tracker_view.detail_scroll > 0);
+
+        app.handle_tracker_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.tracker_view.selected, selected);
+        assert_eq!(app.tracker_view.detail_scroll, 0);
     }
 
     #[test]
@@ -965,9 +1766,28 @@ mod tests {
     fn center_tab_places_focus_near_top() {
         // 40-line diff so the focus line sits within range and clamp does not pin it.
         let diff: Vec<crate::diff::DiffLine> = (0..40)
-            .map(|i| crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(i + 1), new_line_no: Some(i + 1), text: format!("line {i}") })
+            .map(|i| crate::diff::DiffLine {
+                kind: LineKind::Unchanged,
+                old_line_no: Some(i + 1),
+                new_line_no: Some(i + 1),
+                text: format!("line {i}"),
+            })
             .collect();
-        let mut tab = Tab { path: PathBuf::from("a"), content: String::new(), highlighted_lines: vec![], diff, prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: Some(20), center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        let mut tab = Tab {
+            path: PathBuf::from("a"),
+            content: String::new(),
+            highlighted_lines: vec![],
+            diff,
+            prepared_rows: vec![],
+            viewport_cache: None,
+            first_change: None,
+            focus_line: Some(20),
+            center_diff: None,
+            scroll: 0,
+            auto_center: true,
+            selection: None,
+            last_edit: SystemTime::now(),
+        };
         center_tab(&mut tab, 20);
         assert_eq!(tab.scroll, 18);
     }
@@ -977,9 +1797,28 @@ mod tests {
         // 30-line file, 10-row viewport, focus on the last line: the last page
         // fills the viewport rather than leaving blank filler underneath.
         let diff: Vec<crate::diff::DiffLine> = (0..30)
-            .map(|i| crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(i + 1), new_line_no: Some(i + 1), text: format!("line {i}") })
+            .map(|i| crate::diff::DiffLine {
+                kind: LineKind::Unchanged,
+                old_line_no: Some(i + 1),
+                new_line_no: Some(i + 1),
+                text: format!("line {i}"),
+            })
             .collect();
-        let mut tab = Tab { path: PathBuf::from("a"), content: String::new(), highlighted_lines: vec![], diff, prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: Some(29), center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        let mut tab = Tab {
+            path: PathBuf::from("a"),
+            content: String::new(),
+            highlighted_lines: vec![],
+            diff,
+            prepared_rows: vec![],
+            viewport_cache: None,
+            first_change: None,
+            focus_line: Some(29),
+            center_diff: None,
+            scroll: 0,
+            auto_center: true,
+            selection: None,
+            last_edit: SystemTime::now(),
+        };
         center_tab(&mut tab, 10);
         assert_eq!(tab.scroll, 20);
     }
@@ -988,9 +1827,28 @@ mod tests {
     fn clamp_tab_scroll_pins_short_file_to_top() {
         // Shorter-than-viewport file: scroll collapses to 0 so EOF sits flush.
         let diff: Vec<crate::diff::DiffLine> = (0..5)
-            .map(|i| crate::diff::DiffLine { kind: LineKind::Unchanged, old_line_no: Some(i + 1), new_line_no: Some(i + 1), text: format!("line {i}") })
+            .map(|i| crate::diff::DiffLine {
+                kind: LineKind::Unchanged,
+                old_line_no: Some(i + 1),
+                new_line_no: Some(i + 1),
+                text: format!("line {i}"),
+            })
             .collect();
-        let mut tab = Tab { path: PathBuf::from("a"), content: String::new(), highlighted_lines: vec![], diff, prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: Some(4), center_diff: None, scroll: 100, auto_center: false, selection: None, last_edit: SystemTime::now() };
+        let mut tab = Tab {
+            path: PathBuf::from("a"),
+            content: String::new(),
+            highlighted_lines: vec![],
+            diff,
+            prepared_rows: vec![],
+            viewport_cache: None,
+            first_change: None,
+            focus_line: Some(4),
+            center_diff: None,
+            scroll: 100,
+            auto_center: false,
+            selection: None,
+            last_edit: SystemTime::now(),
+        };
         clamp_tab_scroll(&mut tab, 10);
         assert_eq!(tab.scroll, 0);
     }
@@ -998,7 +1856,21 @@ mod tests {
     #[test]
     fn tab_manager_promotes_existing_and_evicts_lru() {
         let mut tm = TabManager::new(2);
-        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: None, center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        let mk = |p: &str| Tab {
+            path: PathBuf::from(p),
+            content: String::new(),
+            highlighted_lines: vec![],
+            diff: vec![],
+            prepared_rows: vec![],
+            viewport_cache: None,
+            first_change: None,
+            focus_line: None,
+            center_diff: None,
+            scroll: 0,
+            auto_center: true,
+            selection: None,
+            last_edit: SystemTime::now(),
+        };
         tm.add_or_bring_to_front(mk("a"));
         tm.add_or_bring_to_front(mk("b"));
         tm.add_or_bring_to_front(mk("a"));
@@ -1011,7 +1883,21 @@ mod tests {
     #[test]
     fn tab_manager_removes_path_and_adjusts_active() {
         let mut tm = TabManager::new(3);
-        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: None, center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        let mk = |p: &str| Tab {
+            path: PathBuf::from(p),
+            content: String::new(),
+            highlighted_lines: vec![],
+            diff: vec![],
+            prepared_rows: vec![],
+            viewport_cache: None,
+            first_change: None,
+            focus_line: None,
+            center_diff: None,
+            scroll: 0,
+            auto_center: true,
+            selection: None,
+            last_edit: SystemTime::now(),
+        };
         tm.add_or_bring_to_front(mk("a"));
         tm.add_or_bring_to_front(mk("b"));
         tm.add_or_bring_to_front(mk("c"));
@@ -1025,7 +1911,21 @@ mod tests {
     #[test]
     fn tab_manager_maps_click_column_to_tab() {
         let mut tm = TabManager::new(3);
-        let mk = |p: &str| Tab { path: PathBuf::from(p), content: String::new(), highlighted_lines: vec![], diff: vec![], prepared_rows: vec![], viewport_cache: None, first_change: None, focus_line: None, center_diff: None, scroll: 0, auto_center: true, selection: None, last_edit: SystemTime::now() };
+        let mk = |p: &str| Tab {
+            path: PathBuf::from(p),
+            content: String::new(),
+            highlighted_lines: vec![],
+            diff: vec![],
+            prepared_rows: vec![],
+            viewport_cache: None,
+            first_change: None,
+            focus_line: None,
+            center_diff: None,
+            scroll: 0,
+            auto_center: true,
+            selection: None,
+            last_edit: SystemTime::now(),
+        };
         tm.add_or_bring_to_front(mk("alpha.rs"));
         tm.add_or_bring_to_front(mk("beta.ts"));
         assert_eq!(tm.tab_hit_at_column(2), Some(TabHit::Select(0)));
@@ -1043,18 +1943,32 @@ mod tests {
         fs::write(root.join("main.rs"), "abcdef\n").unwrap();
 
         let mut app = App::new(root.to_path_buf()).unwrap();
-        app.code_area = Rect { x: 10, y: 5, width: 80, height: 20 };
+        app.code_area = Rect {
+            x: 10,
+            y: 5,
+            width: 80,
+            height: 20,
+        };
 
-        let point = app.mouse_point_to_text_point(10 + code_prefix_width() as u16 + 2, 5).unwrap();
+        let point = app
+            .mouse_point_to_text_point(10 + code_prefix_width() as u16 + 2, 5)
+            .unwrap();
         assert_eq!(point, TextPoint { line: 0, column: 2 });
-        assert!(app.mouse_point_to_text_point(10 + code_prefix_width() as u16 + 2, 4).is_none());
+        assert!(
+            app.mouse_point_to_text_point(10 + code_prefix_width() as u16 + 2, 4)
+                .is_none()
+        );
     }
 
     #[test]
     fn highlighter_returns_styled_text_not_ansi_escapes() {
         let h = Highlighter::new().unwrap();
         let lines = h.highlight_lines(Path::new("main.rs"), "fn main() {}\n");
-        let rendered = lines.into_iter().flatten().map(|s| s.content.into_owned()).collect::<String>();
+        let rendered = lines
+            .into_iter()
+            .flatten()
+            .map(|s| s.content.into_owned())
+            .collect::<String>();
         assert_eq!(rendered, "fn main() {}");
         assert!(!rendered.contains('\u{1b}'));
     }
@@ -1075,16 +1989,44 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         Command::new("git").arg("init").arg(root).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["config", "user.email", "test@example.com"]).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["config", "user.name", "Test User"]).status().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .unwrap();
 
         let path = root.join("main.rs");
-        fs::write(&path, (1..=21).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
-        Command::new("git").arg("-C").arg(root).args(["add", "."]).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["commit", "-m", "init"]).status().unwrap();
+        fs::write(
+            &path,
+            (1..=21).map(|i| format!("line {i}\n")).collect::<String>(),
+        )
+        .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["add", "."])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["commit", "-m", "init"])
+            .status()
+            .unwrap();
 
         let mut app = App::new(root.to_path_buf()).unwrap();
-        fs::write(&path, (1..=22).map(|i| format!("line {i}\n")).collect::<String>()).unwrap();
+        fs::write(
+            &path,
+            (1..=22).map(|i| format!("line {i}\n")).collect::<String>(),
+        )
+        .unwrap();
         app.load_change(path.clone(), SystemTime::now()).unwrap();
 
         let tab = app.tabs.current().unwrap();
@@ -1102,17 +2044,58 @@ mod tests {
         let root = dir.path();
         let remote = remote_dir.path().join("remote.git");
 
-        Command::new("git").arg("init").arg("-b").arg("main").arg(root).status().unwrap();
-        Command::new("git").arg("init").arg("--bare").arg(&remote).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["config", "user.email", "test@example.com"]).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["config", "user.name", "Test User"]).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["remote", "add", "origin", remote.to_str().unwrap()]).status().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .arg(root)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(&remote)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["remote", "add", "origin", remote.to_str().unwrap()])
+            .status()
+            .unwrap();
 
         let path = root.join("main.rs");
         fs::write(&path, "fn main() {}\n").unwrap();
-        Command::new("git").arg("-C").arg(root).args(["add", "."]).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["commit", "-m", "init"]).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["push", "-u", "origin", "main"]).status().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["add", "."])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["commit", "-m", "init"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["push", "-u", "origin", "main"])
+            .status()
+            .unwrap();
 
         let mut app = App::new(root.to_path_buf()).unwrap();
         app.toggle_diff_base();
@@ -1134,30 +2117,104 @@ mod tests {
         let root = dir.path();
         let remote = remote_dir.path().join("remote.git");
 
-        Command::new("git").arg("init").arg("-b").arg("main").arg(root).status().unwrap();
-        Command::new("git").arg("init").arg("--bare").arg(&remote).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["config", "user.email", "test@example.com"]).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["config", "user.name", "Test User"]).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["remote", "add", "origin", remote.to_str().unwrap()]).status().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .arg(root)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(&remote)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["remote", "add", "origin", remote.to_str().unwrap()])
+            .status()
+            .unwrap();
 
         let path = root.join("main.rs");
         fs::write(&path, "fn main() {}\n").unwrap();
-        Command::new("git").arg("-C").arg(root).args(["add", "."]).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["commit", "-m", "init"]).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["push", "-u", "origin", "main"]).status().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["add", "."])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["commit", "-m", "init"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["push", "-u", "origin", "main"])
+            .status()
+            .unwrap();
 
         let mut app = App::new(root.to_path_buf()).unwrap();
         app.toggle_diff_base();
         fs::write(&path, "fn main() {}\nprintln!(\"hi\");\n").unwrap();
         app.load_change(path.clone(), SystemTime::now()).unwrap();
-        assert_eq!(app.tabs.current().unwrap().diff.iter().filter(|l| l.kind != LineKind::Unchanged).count(), 1);
+        assert_eq!(
+            app.tabs
+                .current()
+                .unwrap()
+                .diff
+                .iter()
+                .filter(|l| l.kind != LineKind::Unchanged)
+                .count(),
+            1
+        );
 
-        Command::new("git").arg("-C").arg(root).args(["add", "."]).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["commit", "-m", "second"]).status().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["push", "origin", "main"]).status().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["add", "."])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["commit", "-m", "second"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["push", "origin", "main"])
+            .status()
+            .unwrap();
 
         app.last_git_ref_probe = Instant::now() - GIT_REF_REFRESH_INTERVAL;
         assert!(app.scan_for_git_ref_changes());
-        assert_eq!(app.tabs.current().unwrap().diff.iter().filter(|l| l.kind != LineKind::Unchanged).count(), 0);
+        assert_eq!(
+            app.tabs
+                .current()
+                .unwrap()
+                .diff
+                .iter()
+                .filter(|l| l.kind != LineKind::Unchanged)
+                .count(),
+            0
+        );
     }
 }
