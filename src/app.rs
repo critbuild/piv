@@ -7,36 +7,40 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use chrono::{DateTime, Local};
 use crossterm::event::{
     self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
 use ratatui::{
-    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
+    Frame, Terminal,
 };
 
 use crate::{
     code_pane::{
-        CodePaneOverlays, RemoteHighlightOverlay, SearchOverlay, code_prefix_width, prepare_rows,
-        render_code_pane,
+        code_prefix_width, prepare_rows, render_code_pane, CodePaneOverlays,
+        RemoteHighlightOverlay, SearchOverlay,
     },
     control::{ControlCommand, ControlServer},
     diff::{DiffEngine, LineKind},
-    file_intake::{FileIntake, row_index_for_new_line},
+    file_intake::{row_index_for_new_line, FileIntake},
     highlight::Highlighter,
+    issue_cockpit::{
+        build_issue_cockpit_view, match_project_for_root, render_issue_cockpit_lines,
+        tracker_status_fragment, CockpitScopeMode, IssueCockpitState,
+    },
     model::{Selection, Tab, TabHit, TabManager, TextPoint},
     search::{Match as SearchMatch, SearchQuery},
     tracker::TrackerStore,
     tracker_ui::{
-        TrackerItemRef, TrackerViewState, max_tracker_detail_scroll, render_tracker_view_lines,
-        visible_items,
+        max_tracker_detail_scroll, render_tracker_view_lines, visible_items, TrackerItemRef,
+        TrackerViewState,
     },
     watcher::{FileWatcher, WatchEvent},
 };
@@ -49,6 +53,7 @@ const MOUSE_SCROLL_LINES: usize = 5;
 const FALLBACK_SCAN_INTERVAL: Duration = Duration::from_millis(750);
 const FALLBACK_SCAN_IDLE_DELAY: Duration = Duration::from_millis(1200);
 const GIT_REF_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+const TRACKER_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const HIGHLIGHT_FADE_DURATION: Duration = Duration::from_secs(10);
 const AUTO_FOCUS_TOP_PADDING: usize = 2;
 const ASSUMED_EDITOR_BG: (u8, u8, u8) = (0x17, 0x23, 0x27);
@@ -101,8 +106,13 @@ pub struct App {
     last_search: Option<CommittedSearch>,
     mode: InteractionMode,
     tracker: Option<TrackerStore>,
+    tracker_snapshot: Option<crate::tracker::TrackerSnapshot>,
+    last_tracker_refresh: Instant,
     tracker_view: TrackerViewState,
+    tracker_scope_mode: CockpitScopeMode,
     tracker_notice: Option<String>,
+    issue_cockpit: IssueCockpitState,
+    issue_cockpit_area: Rect,
 }
 
 struct CommittedSearch {
@@ -149,8 +159,13 @@ impl App {
             last_search: None,
             mode: InteractionMode::Code,
             tracker: None,
+            tracker_snapshot: None,
+            last_tracker_refresh: Instant::now() - TRACKER_REFRESH_INTERVAL,
             tracker_view: TrackerViewState::default(),
+            tracker_scope_mode: CockpitScopeMode::Auto,
             tracker_notice: None,
+            issue_cockpit: IssueCockpitState::default(),
+            issue_cockpit_area: Rect::default(),
         };
         app.last_seen_diff_base_rev = app.current_diff_base_rev();
         app.seed_seen_mtimes()?;
@@ -175,6 +190,9 @@ impl App {
     ) -> Result<()> {
         let mut should_draw = true;
         loop {
+            if self.refresh_tracker_context_if_due() {
+                should_draw = true;
+            }
             if should_draw {
                 terminal.draw(|f| self.render(f))?;
                 should_draw = false;
@@ -451,7 +469,10 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
-        if matches!((key.code, key.modifiers), (KeyCode::Char('c'), KeyModifiers::CONTROL)) {
+        if matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL)
+        ) {
             return true;
         }
         match &self.mode {
@@ -479,7 +500,20 @@ impl App {
         }
         match (key.code, key.modifiers) {
             (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return true,
-            (KeyCode::Char(':'), _) | (KeyCode::Char(';'), KeyModifiers::SHIFT) => self.begin_command(),
+            (KeyCode::Char('i'), _) => self.toggle_issue_cockpit(),
+            (KeyCode::Char('a'), _) if self.issue_cockpit.open => self.toggle_issue_cockpit_scope(),
+            (KeyCode::Char('r'), _) if self.issue_cockpit.open => {
+                self.select_next_issue_cockpit_ref()
+            }
+            (KeyCode::Char('R'), KeyModifiers::SHIFT) if self.issue_cockpit.open => {
+                self.select_prev_issue_cockpit_ref()
+            }
+            (KeyCode::Enter, _) if self.issue_cockpit.open => {
+                self.open_selected_issue_cockpit_ref()
+            }
+            (KeyCode::Char(':'), _) | (KeyCode::Char(';'), KeyModifiers::SHIFT) => {
+                self.begin_command()
+            }
             (KeyCode::Char('/'), _) => self.begin_search(),
             (KeyCode::Char('n'), _) => self.cycle_search(true),
             (KeyCode::Char('N'), KeyModifiers::SHIFT) => self.cycle_search(false),
@@ -649,20 +683,18 @@ impl App {
         }
         let prompting =
             self.search_input.is_some() || matches!(self.mode, InteractionMode::Command(_));
-        let constraints = if prompting {
-            vec![
-                Constraint::Length(1),
-                Constraint::Min(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ]
-        } else {
-            vec![
-                Constraint::Length(1),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ]
-        };
+        let cockpit_height = self
+            .issue_cockpit
+            .open
+            .then(|| issue_cockpit_height(f.area().height, prompting));
+        let mut constraints = vec![Constraint::Length(1), Constraint::Min(1)];
+        if let Some(height) = cockpit_height {
+            constraints.push(Constraint::Length(height));
+        }
+        if prompting {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Length(1));
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
@@ -671,13 +703,22 @@ impl App {
         self.code_area = chunks[1];
         self.render_tabs(f, chunks[0]);
         self.render_code(f, chunks[1]);
-        let (prompt_idx, status_idx) = if prompting { (2, 3) } else { (1, 2) };
-        if self.search_input.is_some() {
-            self.render_search_prompt(f, chunks[prompt_idx]);
-        } else if matches!(self.mode, InteractionMode::Command(_)) {
-            self.render_command_prompt(f, chunks[prompt_idx]);
+        let mut next_idx = 2;
+        if let Some(height) = cockpit_height {
+            self.issue_cockpit_area = chunks[next_idx];
+            self.render_issue_cockpit(f, chunks[next_idx], usize::from(height));
+            next_idx += 1;
+        } else {
+            self.issue_cockpit_area = Rect::default();
         }
-        self.render_status(f, chunks[status_idx]);
+        if self.search_input.is_some() {
+            self.render_search_prompt(f, chunks[next_idx]);
+            next_idx += 1;
+        } else if matches!(self.mode, InteractionMode::Command(_)) {
+            self.render_command_prompt(f, chunks[next_idx]);
+            next_idx += 1;
+        }
+        self.render_status(f, chunks[next_idx]);
     }
 
     fn render_tabs(&self, f: &mut Frame, area: Rect) {
@@ -810,13 +851,46 @@ impl App {
         );
     }
 
+    fn render_issue_cockpit(&mut self, f: &mut Frame, area: Rect, height: usize) {
+        let rows = match self.tracker_snapshot.as_ref() {
+            Some(snapshot) => {
+                let ref_count = self.current_issue_cockpit_ref_count();
+                self.issue_cockpit.clamp_selected_ref(ref_count);
+                render_issue_cockpit_lines(
+                    snapshot,
+                    &self.root,
+                    &self.issue_cockpit,
+                    area.width as usize,
+                    height,
+                )
+            }
+            None => vec![
+                Line::raw("Issue Cockpit"),
+                Line::raw("─".repeat(area.width as usize)),
+                Line::raw(
+                    self.tracker_notice
+                        .clone()
+                        .unwrap_or_else(|| "Tracker database unavailable.".to_string()),
+                ),
+            ],
+        };
+        f.render_widget(Paragraph::new(rows), area);
+    }
+
     fn render_tracker(&mut self, f: &mut Frame, area: Rect) {
         let rows = match self
             .tracker
             .as_ref()
             .and_then(|tracker| tracker.snapshot().ok())
         {
-            Some(snapshot) => {
+            Some(raw_snapshot) => {
+                let header = self.tracker_scope_header(&raw_snapshot);
+                let snapshot = self.scope_tracker_snapshot(raw_snapshot);
+                let item_count = visible_items(&snapshot, &self.tracker_view).len();
+                if item_count > 0 && self.tracker_view.selected >= item_count {
+                    self.tracker_view.selected = item_count - 1;
+                    self.tracker_view.reset_detail_scroll();
+                }
                 let max_scroll = max_tracker_detail_scroll(
                     &snapshot,
                     &self.tracker_view,
@@ -824,13 +898,22 @@ impl App {
                     area.height as usize,
                 );
                 self.tracker_view.clamp_detail_scroll(max_scroll);
-                render_tracker_view_lines(
+                let mut rows = render_tracker_view_lines(
                     &snapshot,
                     &self.tracker_view,
                     area.width as usize,
                     area.height as usize,
-                )
-            },
+                );
+                if let Some(first) = rows.first_mut() {
+                    *first = Line::styled(
+                        header,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+                rows
+            }
             None => vec![
                 Line::raw("PRD Tracker                                      :prd"),
                 Line::raw(""),
@@ -848,6 +931,7 @@ impl App {
         let copied = self
             .copy_notice_until
             .is_some_and(|until| until > Instant::now());
+        let tracker_suffix = self.tracker_status_suffix();
         let text = if let Some(tab) = self.tabs.current() {
             let rel = tab
                 .path
@@ -861,7 +945,7 @@ impl App {
                 .count();
             let ts: DateTime<Local> = tab.last_edit.into();
             format!(
-                "{} | diff {} | {} lines | {} changes | tab {}/{} | last edit {} | {}{}{}",
+                "{} | diff {} | {} lines | {} changes | tab {}/{} | last edit {} | {}{}{}{}",
                 rel,
                 self.diff_base.label(),
                 tab.content.lines().count(),
@@ -884,14 +968,16 @@ impl App {
                             format!(" | hl {}-{}", start_line + 1, end_line + 1)
                         },
                     _ => String::new(),
-                }
+                },
+                tracker_suffix
             )
         } else {
             format!(
-                "watching {} | diff {} | idle{}",
+                "watching {} | diff {} | idle{}{}",
                 self.root.display(),
                 self.diff_base.label(),
-                if copied { " | copied" } else { "" }
+                if copied { " | copied" } else { "" },
+                tracker_suffix
             )
         };
         f.render_widget(Paragraph::new(text), area);
@@ -1010,6 +1096,13 @@ fn next_diff_center(
     }
 }
 
+fn issue_cockpit_height(total_height: u16, prompting: bool) -> u16 {
+    let reserved = 2 + u16::from(prompting);
+    let available = total_height.saturating_sub(reserved + 1);
+    let preferred = (total_height / 3).clamp(6, 12);
+    preferred.min(available).max(1)
+}
+
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x
         && row >= rect.y
@@ -1082,13 +1175,127 @@ impl App {
     }
 
     fn enter_tracker_mode(&mut self) {
-        if self.tracker.is_none() {
-            match TrackerStore::open_default() {
-                Ok(store) => self.tracker = Some(store),
-                Err(error) => self.tracker_notice = Some(format!("tracker unavailable: {error}")),
+        self.ensure_tracker_open();
+        self.refresh_tracker_context();
+        self.mode = InteractionMode::Tracker;
+    }
+
+    fn ensure_tracker_open(&mut self) -> bool {
+        if self.tracker.is_some() {
+            return true;
+        }
+        match TrackerStore::open_default() {
+            Ok(store) => {
+                self.tracker = Some(store);
+                self.tracker_notice = None;
+                true
+            }
+            Err(error) => {
+                self.tracker_notice = Some(format!("tracker unavailable: {error}"));
+                false
             }
         }
-        self.mode = InteractionMode::Tracker;
+    }
+
+    fn refresh_tracker_context_if_due(&mut self) -> bool {
+        if self.last_tracker_refresh.elapsed() < TRACKER_REFRESH_INTERVAL {
+            return false;
+        }
+        self.refresh_tracker_context()
+    }
+
+    fn refresh_tracker_context(&mut self) -> bool {
+        self.last_tracker_refresh = Instant::now();
+        if !self.ensure_tracker_open() {
+            self.tracker_snapshot = None;
+            return false;
+        }
+        let Some(tracker) = self.tracker.as_ref() else {
+            return false;
+        };
+        match tracker.snapshot() {
+            Ok(snapshot) => {
+                let changed = self.tracker_snapshot.as_ref() != Some(&snapshot);
+                self.tracker_snapshot = Some(snapshot);
+                self.tracker_notice = None;
+                changed
+            }
+            Err(error) => {
+                self.tracker_notice = Some(format!("tracker unavailable: {error}"));
+                self.tracker_snapshot = None;
+                false
+            }
+        }
+    }
+
+    fn tracker_status_suffix(&self) -> String {
+        if let Some(snapshot) = &self.tracker_snapshot {
+            return format!(
+                " | {}",
+                tracker_status_fragment(snapshot, &self.root, &self.issue_cockpit)
+            );
+        }
+        self.tracker_notice
+            .as_ref()
+            .map(|notice| format!(" | {notice}"))
+            .unwrap_or_default()
+    }
+
+    fn toggle_issue_cockpit(&mut self) {
+        self.issue_cockpit.toggle_open();
+        self.refresh_tracker_context();
+    }
+
+    fn toggle_issue_cockpit_scope(&mut self) {
+        let Some(snapshot) = &self.tracker_snapshot else {
+            return;
+        };
+        if match_project_for_root(snapshot, &self.root).is_none() {
+            return;
+        }
+        self.issue_cockpit.toggle_scope();
+        self.refresh_tracker_context();
+    }
+
+    fn current_issue_cockpit_ref_count(&self) -> usize {
+        self.tracker_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                build_issue_cockpit_view(snapshot, &self.root, &self.issue_cockpit)
+                    .refs
+                    .len()
+            })
+            .unwrap_or(0)
+    }
+
+    fn select_next_issue_cockpit_ref(&mut self) {
+        let count = self.current_issue_cockpit_ref_count();
+        self.issue_cockpit.select_next_ref(count);
+    }
+
+    fn select_prev_issue_cockpit_ref(&mut self) {
+        let count = self.current_issue_cockpit_ref_count();
+        self.issue_cockpit.select_prev_ref(count);
+    }
+
+    fn open_selected_issue_cockpit_ref(&mut self) {
+        if self.tracker_snapshot.is_none() {
+            self.refresh_tracker_context();
+        }
+        let Some(reference) = self.tracker_snapshot.as_ref().and_then(|snapshot| {
+            let view = build_issue_cockpit_view(snapshot, &self.root, &self.issue_cockpit);
+            view.refs.get(self.issue_cockpit.selected_ref).cloned()
+        }) else {
+            return;
+        };
+        let result = if reference.is_range() {
+            self.highlight_path(reference.path, reference.start_line, reference.end_line)
+        } else {
+            self.open_path(reference.path, Some(reference.start_line))
+        };
+        if let Err(error) = result {
+            self.tracker_notice = Some(format!("file reference unavailable: {error}"));
+        }
     }
 
     fn in_tracker_mode(&self) -> bool {
@@ -1114,6 +1321,7 @@ impl App {
             (KeyCode::End, _) => self.tracker_view.scroll_detail_down(usize::MAX / 2),
             (KeyCode::Char('l'), _) | (KeyCode::Enter, _) => self.toggle_selected_tracker_row(),
             (KeyCode::Char('h'), _) => self.collapse_selected_tracker_row(),
+            (KeyCode::Char('a'), _) => self.toggle_tracker_scope(),
             (KeyCode::Char(' '), _) => self.cycle_selected_issue_status(),
             (KeyCode::Char('p'), _) => self.cycle_selected_prd_status(),
             _ => {}
@@ -1142,10 +1350,60 @@ impl App {
         }
     }
 
+    fn tracker_scope_header(&self, snapshot: &crate::tracker::TrackerSnapshot) -> String {
+        match match_project_for_root(snapshot, &self.root) {
+            Some(matched) if self.tracker_scope_mode == CockpitScopeMode::Auto => format!(
+                "Project / PRD / Issue tree   scope {}   a: show all",
+                matched.project_key
+            ),
+            Some(_) => "Project / PRD / Issue tree   scope all   a: current project".to_string(),
+            None => "Project / PRD / Issue tree   scope all (no root match)".to_string(),
+        }
+    }
+
     fn tracker_snapshot(&self) -> Option<crate::tracker::TrackerSnapshot> {
         self.tracker
             .as_ref()
             .and_then(|tracker| tracker.snapshot().ok())
+            .map(|snapshot| self.scope_tracker_snapshot(snapshot))
+    }
+
+    fn scope_tracker_snapshot(
+        &self,
+        snapshot: crate::tracker::TrackerSnapshot,
+    ) -> crate::tracker::TrackerSnapshot {
+        if self.tracker_scope_mode == CockpitScopeMode::AllProjects {
+            return snapshot;
+        }
+        let Some(matched) = match_project_for_root(&snapshot, &self.root) else {
+            return snapshot;
+        };
+        crate::tracker::TrackerSnapshot {
+            projects: snapshot
+                .projects
+                .into_iter()
+                .filter(|project| project.project.key == matched.project_key)
+                .collect(),
+        }
+    }
+
+    fn toggle_tracker_scope(&mut self) {
+        let Some(snapshot) = self
+            .tracker
+            .as_ref()
+            .and_then(|tracker| tracker.snapshot().ok())
+        else {
+            return;
+        };
+        if match_project_for_root(&snapshot, &self.root).is_none() {
+            return;
+        }
+        self.tracker_scope_mode = match self.tracker_scope_mode {
+            CockpitScopeMode::Auto => CockpitScopeMode::AllProjects,
+            CockpitScopeMode::AllProjects => CockpitScopeMode::Auto,
+        };
+        self.tracker_view.selected = 0;
+        self.tracker_view.reset_detail_scroll();
     }
 
     fn selected_tracker_item(&self) -> Option<TrackerItemRef> {
@@ -1211,8 +1469,13 @@ impl App {
             return;
         };
         if let Some(tracker) = self.tracker.as_mut() {
-            if let Err(error) = tracker.set_issue_status(&project_key, &issue_key, status) {
-                self.tracker_notice = Some(error.to_string());
+            match tracker.set_issue_status(&project_key, &issue_key, status) {
+                Ok(()) => {
+                    self.refresh_tracker_context();
+                }
+                Err(error) => {
+                    self.tracker_notice = Some(error.to_string());
+                }
             }
         }
     }
@@ -1238,8 +1501,13 @@ impl App {
             return;
         };
         if let Some(tracker) = self.tracker.as_mut() {
-            if let Err(error) = tracker.set_prd_status(&project_key, &prd_key, status) {
-                self.tracker_notice = Some(error.to_string());
+            match tracker.set_prd_status(&project_key, &prd_key, status) {
+                Ok(()) => {
+                    self.refresh_tracker_context();
+                }
+                Err(error) => {
+                    self.tracker_notice = Some(error.to_string());
+                }
             }
         }
     }
@@ -1668,6 +1936,254 @@ mod tests {
     }
 
     #[test]
+    fn prd_tracker_scopes_to_project_matching_watched_root_by_default() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let piv_root = dir.path().join("piv");
+        let fairy_root = dir.path().join("fairy");
+        fs::create_dir_all(&piv_root).unwrap();
+        fs::create_dir_all(&fairy_root).unwrap();
+        fs::write(piv_root.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let mut store = TrackerStore::open_in_memory().unwrap();
+        store
+            .create_project("piv", "piv", &[piv_root.to_str().unwrap()])
+            .unwrap();
+        store
+            .create_project("fairy", "Fairy", &[fairy_root.to_str().unwrap()])
+            .unwrap();
+        store
+            .upsert_plan(
+                "piv",
+                crate::tracker::PrdInput {
+                    key: "piv-prd".into(),
+                    title: "piv PRD".into(),
+                    status: crate::tracker::PrdStatus::InProgress,
+                    body: None,
+                    source_uri: None,
+                },
+                vec![],
+            )
+            .unwrap();
+        store
+            .upsert_plan(
+                "fairy",
+                crate::tracker::PrdInput {
+                    key: "fairy-prd".into(),
+                    title: "Fairy PRD".into(),
+                    status: crate::tracker::PrdStatus::InProgress,
+                    body: None,
+                    source_uri: None,
+                },
+                vec![],
+            )
+            .unwrap();
+
+        let mut app = App::new(piv_root.clone()).unwrap();
+        app.tracker = Some(store);
+
+        let raw = app.tracker.as_ref().unwrap().snapshot().unwrap();
+        assert!(app.tracker_scope_header(&raw).contains("scope piv"));
+        assert!(app.tracker_scope_header(&raw).contains("a: show all"));
+
+        let scoped = app.tracker_snapshot().unwrap();
+        assert_eq!(scoped.projects.len(), 1);
+        assert_eq!(scoped.projects[0].project.key, "piv");
+
+        app.handle_tracker_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.tracker_scope_header(&raw).contains("scope all"));
+        assert!(app
+            .tracker_scope_header(&raw)
+            .contains("a: current project"));
+        let all = app.tracker_snapshot().unwrap();
+        assert_eq!(all.projects.len(), 2);
+    }
+
+    #[test]
+    fn i_toggles_issue_cockpit_without_entering_full_tracker_mode() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.tracker = Some(TrackerStore::open_in_memory().unwrap());
+        assert!(!app.issue_cockpit.open);
+        assert!(!app.in_tracker_mode());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(app.issue_cockpit.open);
+        assert!(!app.in_tracker_mode());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(!app.issue_cockpit.open);
+        assert!(!app.in_tracker_mode());
+    }
+
+    #[test]
+    fn tracker_context_refresh_updates_status_and_unblocks_next_issue() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let mut store = TrackerStore::open_in_memory().unwrap();
+        store
+            .create_project("piv", "piv", &[root.to_str().unwrap()])
+            .unwrap();
+        store
+            .upsert_plan(
+                "piv",
+                crate::tracker::PrdInput {
+                    key: "cockpit".into(),
+                    title: "Cockpit".into(),
+                    status: crate::tracker::PrdStatus::InProgress,
+                    body: None,
+                    source_uri: None,
+                },
+                vec![
+                    crate::tracker::PlanIssueInput {
+                        key: "first".into(),
+                        title: "First issue".into(),
+                        status: crate::tracker::IssueStatus::Open,
+                        body: None,
+                        position: 1,
+                        depends_on: vec![],
+                    },
+                    crate::tracker::PlanIssueInput {
+                        key: "second".into(),
+                        title: "Second issue".into(),
+                        status: crate::tracker::IssueStatus::Open,
+                        body: None,
+                        position: 2,
+                        depends_on: vec!["first".into()],
+                    },
+                ],
+            )
+            .unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.tracker = Some(store);
+        app.refresh_tracker_context();
+        assert!(app.tracker_status_suffix().contains("◌ open first"));
+
+        app.tracker
+            .as_mut()
+            .unwrap()
+            .set_issue_status("piv", "first", crate::tracker::IssueStatus::InProgress)
+            .unwrap();
+        app.refresh_tracker_context();
+        assert!(app.tracker_status_suffix().contains("● in progress first"));
+
+        app.tracker
+            .as_mut()
+            .unwrap()
+            .set_issue_status("piv", "first", crate::tracker::IssueStatus::Complete)
+            .unwrap();
+        app.refresh_tracker_context();
+        assert!(app.tracker_status_suffix().contains("◌ open second"));
+    }
+
+    #[test]
+    fn issue_cockpit_enter_opens_selected_line_reference() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("main.rs");
+        fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+        let mut store = TrackerStore::open_in_memory().unwrap();
+        store
+            .create_project("piv", "piv", &[root.to_str().unwrap()])
+            .unwrap();
+        store
+            .upsert_plan(
+                "piv",
+                crate::tracker::PrdInput {
+                    key: "refs".into(),
+                    title: "Refs".into(),
+                    status: crate::tracker::PrdStatus::InProgress,
+                    body: None,
+                    source_uri: None,
+                },
+                vec![crate::tracker::PlanIssueInput {
+                    key: "line-ref".into(),
+                    title: "Line ref".into(),
+                    status: crate::tracker::IssueStatus::Open,
+                    body: Some("Open main.rs:2".into()),
+                    position: 1,
+                    depends_on: vec![],
+                }],
+            )
+            .unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.tracker = Some(store);
+        app.issue_cockpit.open = true;
+        app.refresh_tracker_context();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let tab = app.tabs.current().unwrap();
+        assert_eq!(tab.path, path.canonicalize().unwrap());
+        assert_eq!(tab.focus_line, Some(1));
+        assert!(app.remote_highlight.is_none());
+    }
+
+    #[test]
+    fn issue_cockpit_enter_highlights_selected_range_reference() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("main.rs");
+        fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+        let mut store = TrackerStore::open_in_memory().unwrap();
+        store
+            .create_project("piv", "piv", &[root.to_str().unwrap()])
+            .unwrap();
+        store
+            .upsert_plan(
+                "piv",
+                crate::tracker::PrdInput {
+                    key: "refs".into(),
+                    title: "Refs".into(),
+                    status: crate::tracker::PrdStatus::InProgress,
+                    body: None,
+                    source_uri: None,
+                },
+                vec![crate::tracker::PlanIssueInput {
+                    key: "range-ref".into(),
+                    title: "Range ref".into(),
+                    status: crate::tracker::IssueStatus::Open,
+                    body: Some("Open main.rs:2-3".into()),
+                    position: 1,
+                    depends_on: vec![],
+                }],
+            )
+            .unwrap();
+
+        let mut app = App::new(root.to_path_buf()).unwrap();
+        app.tracker = Some(store);
+        app.issue_cockpit.open = true;
+        app.refresh_tracker_context();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let (highlight_path, start, end, _) = app.remote_highlight.as_ref().unwrap();
+        assert_eq!(highlight_path, &path.canonicalize().unwrap());
+        assert_eq!((*start, *end), (1, 2));
+    }
+
+    #[test]
     fn tracker_page_keys_scroll_detail_pane() {
         use std::fs;
         use tempfile::tempdir;
@@ -1954,10 +2470,9 @@ mod tests {
             .mouse_point_to_text_point(10 + code_prefix_width() as u16 + 2, 5)
             .unwrap();
         assert_eq!(point, TextPoint { line: 0, column: 2 });
-        assert!(
-            app.mouse_point_to_text_point(10 + code_prefix_width() as u16 + 2, 4)
-                .is_none()
-        );
+        assert!(app
+            .mouse_point_to_text_point(10 + code_prefix_width() as u16 + 2, 4)
+            .is_none());
     }
 
     #[test]

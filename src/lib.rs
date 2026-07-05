@@ -5,6 +5,7 @@ pub mod control;
 pub mod diff;
 pub mod file_intake;
 pub mod highlight;
+pub mod issue_cockpit;
 pub mod model;
 pub mod search;
 pub mod tracker;

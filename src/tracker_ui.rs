@@ -527,7 +527,7 @@ fn styled_tracker_line(row: String) -> Line<'static> {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
-    } else if trimmed.starts_with("▸ ") {
+    } else if trimmed.starts_with("▸ ") || trimmed.starts_with("▾ ") {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)

@@ -223,6 +223,10 @@ fn tracker_view_lines_style_selection_headings_and_status_badges() {
         .iter()
         .find(|line| line_text(line).contains("Project / PRD / Issue tree"))
         .unwrap();
+    let expanded_project = lines
+        .iter()
+        .find(|line| line_text(line).contains("  ▾ piv"))
+        .unwrap();
     let selected_prd = lines
         .iter()
         .find(|line| line_text(line).contains("›   ▾ Detail polish"))
@@ -233,6 +237,7 @@ fn tracker_view_lines_style_selection_headings_and_status_badges() {
         .unwrap();
 
     assert_eq!(heading.style.fg, Some(Color::Cyan));
+    assert_eq!(expanded_project.style.fg, Some(Color::Cyan));
     assert!(selected_prd.style.add_modifier.contains(Modifier::BOLD));
     assert_eq!(selected_prd.style.fg, Some(Color::Cyan));
     assert_eq!(blocked_issue.style.fg, Some(Color::Rgb(230, 170, 70)));
