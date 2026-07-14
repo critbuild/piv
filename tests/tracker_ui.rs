@@ -1,11 +1,16 @@
 use piv::{
     tracker::{IssueStatus, PlanIssueInput, PrdInput, PrdStatus, TrackerStore},
     tracker_ui::{
-        TrackerViewState, max_tracker_detail_scroll, render_tracker_rows, render_tracker_view,
-        render_tracker_view_lines, render_tracker_viewport,
+        TrackerViewState, max_tracker_detail_scroll, max_tracker_menu_scroll,
+        render_tracker_detail_viewport, render_tracker_menu_viewport, render_tracker_rows,
+        render_tracker_view, render_tracker_view_lines, render_tracker_viewport,
+        tracker_menu_item_at_row,
     },
 };
-use ratatui::{style::{Color, Modifier}, text::Line};
+use ratatui::{
+    style::{Color, Modifier},
+    text::Line,
+};
 
 fn line_text(line: &Line<'_>) -> String {
     line.spans
@@ -17,6 +22,118 @@ fn line_text(line: &Line<'_>) -> String {
 
 fn char_index(text: &str, needle: &str) -> Option<usize> {
     text.find(needle).map(|byte| text[..byte].chars().count())
+}
+
+fn scrolling_snapshot() -> (piv::tracker::TrackerSnapshot, TrackerViewState) {
+    let mut store = TrackerStore::open_in_memory().unwrap();
+    store.create_project("piv", "piv", &[]).unwrap();
+    let issues = (1..=12)
+        .map(|position| PlanIssueInput {
+            key: format!("issue-{position}"),
+            title: format!("Issue {position}"),
+            status: IssueStatus::Open,
+            body: Some(
+                (1..=8)
+                    .map(|line| format!("detail line {position}-{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            position,
+            depends_on: vec![],
+        })
+        .collect();
+    store
+        .upsert_plan(
+            "piv",
+            PrdInput {
+                key: "scrolling".into(),
+                title: "Scrolling".into(),
+                status: PrdStatus::InProgress,
+                body: Some(
+                    (1..=30)
+                        .map(|line| {
+                            format!(
+                                "long PRD detail line {line} has enough words to wrap differently by pane width"
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                source_uri: None,
+            },
+            issues,
+        )
+        .unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let mut state = TrackerViewState::default();
+    state.expand("project:piv");
+    state.expand("prd:piv/scrolling");
+    (snapshot, state)
+}
+
+#[test]
+fn tracker_menu_max_scroll_clamps_and_renders_only_the_scrolled_viewport() {
+    let (snapshot, mut state) = scrolling_snapshot();
+    assert_eq!(max_tracker_menu_scroll(&snapshot, &state, 6), 10);
+
+    state.menu_scroll = usize::MAX;
+    state.clamp_menu_scroll(max_tracker_menu_scroll(&snapshot, &state, 6));
+    let rows = render_tracker_menu_viewport(&snapshot, &state, 100, 6);
+
+    assert_eq!(state.menu_scroll, 10);
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0], "Project / PRD / Issue tree");
+    assert!(rows[2].contains("9. Issue 9"));
+    assert!(rows[5].contains("12. Issue 12"));
+}
+
+#[test]
+fn tracker_menu_hit_mapping_uses_local_rows_and_scroll_and_rejects_non_items() {
+    let (snapshot, mut state) = scrolling_snapshot();
+    state.menu_scroll = 3;
+
+    assert_eq!(tracker_menu_item_at_row(&snapshot, &state, 0, 6), None);
+    assert_eq!(tracker_menu_item_at_row(&snapshot, &state, 1, 6), None);
+    assert_eq!(tracker_menu_item_at_row(&snapshot, &state, 2, 6), Some(3));
+    assert_eq!(tracker_menu_item_at_row(&snapshot, &state, 5, 6), Some(6));
+    assert_eq!(tracker_menu_item_at_row(&snapshot, &state, 6, 6), None);
+
+    state.collapse("project:piv");
+    state.menu_scroll = 0;
+    assert_eq!(tracker_menu_item_at_row(&snapshot, &state, 3, 8), None);
+}
+
+#[test]
+fn tracker_keyboard_selection_reveal_moves_only_as_far_as_needed() {
+    let mut state = TrackerViewState::default();
+    state.selected = 7;
+    state.reveal_selected(5);
+    assert_eq!(state.menu_scroll, 5);
+
+    state.selected = 6;
+    state.reveal_selected(5);
+    assert_eq!(state.menu_scroll, 5);
+
+    state.selected = 3;
+    state.reveal_selected(5);
+    assert_eq!(state.menu_scroll, 3);
+}
+
+#[test]
+fn tracker_detail_scroll_and_wrapping_use_detail_pane_dimensions() {
+    let (snapshot, mut state) = scrolling_snapshot();
+    state.selected = 1;
+    let narrow_max = max_tracker_detail_scroll(&snapshot, &state, 28, 10);
+    let wide_max = max_tracker_detail_scroll(&snapshot, &state, 60, 10);
+    assert!(narrow_max > wide_max);
+
+    state.detail_scroll = narrow_max;
+    let narrow = render_tracker_detail_viewport(&snapshot, &state, 28, 10);
+    let wide = render_tracker_detail_viewport(&snapshot, &state, 60, 10);
+    assert_eq!(narrow.len(), 10);
+    assert_eq!(wide.len(), 10);
+    assert!(narrow.last().unwrap().contains("Details"));
+    assert_ne!(narrow, wide);
 }
 
 #[test]
@@ -83,12 +200,9 @@ fn tracker_rows_render_project_prd_and_ordered_issues_with_blocker_glyphs() {
         rows.iter()
             .any(|row| row.contains("2. Add tracker socket") && row.contains("◌ open"))
     );
-    assert!(
-        rows.iter()
-            .any(|row| row.contains("3. Add tracker UI")
-                && row.contains("◆ blocked")
-                && row.contains("blocked by socket-api"))
-    );
+    assert!(rows.iter().any(|row| row.contains("3. Add tracker UI")
+        && row.contains("◆ blocked")
+        && row.contains("blocked by socket-api")));
 }
 
 #[test]
@@ -171,9 +285,15 @@ fn tracker_rows_align_issue_prd_and_project_status_columns() {
     let rows = render_tracker_rows(&snapshot, &state, 100);
     let project = rows.iter().find(|row| row.contains("▾ piv")).unwrap();
     let prd = rows.iter().find(|row| row.contains("▾ Alignment")).unwrap();
-    let issue = rows.iter().find(|row| row.contains("1. Finished issue")).unwrap();
+    let issue = rows
+        .iter()
+        .find(|row| row.contains("1. Finished issue"))
+        .unwrap();
 
-    assert_eq!(char_index(prd, "✓ complete"), char_index(issue, "✓ complete"));
+    assert_eq!(
+        char_index(prd, "✓ complete"),
+        char_index(issue, "✓ complete")
+    );
     assert_eq!(char_index(project, "1 PRDs"), char_index(prd, "1/1"));
 }
 
@@ -233,7 +353,9 @@ fn tracker_view_lines_style_selection_headings_and_status_badges() {
         .unwrap();
     let blocked_issue = lines
         .iter()
-        .find(|line| line_text(line).contains("Blocked issue") && line_text(line).contains("◆ blocked"))
+        .find(|line| {
+            line_text(line).contains("Blocked issue") && line_text(line).contains("◆ blocked")
+        })
         .unwrap();
 
     assert_eq!(heading.style.fg, Some(Color::Cyan));
@@ -398,7 +520,11 @@ fn wide_tracker_viewport_scrolls_detail_pane_with_footer() {
     let rendered = rows.join("\n");
 
     assert!(rendered.contains("long detail line 9"));
-    assert!(!rows.iter().any(|row| row.trim_end().ends_with("long detail line 1")));
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.trim_end().ends_with("long detail line 1"))
+    );
     assert!(rendered.contains("PgUp/PgDn scroll"));
 }
 
@@ -464,9 +590,16 @@ fn wide_tracker_view_has_horizontal_separator_and_full_width_padded_detail_text(
 
     let rows = render_tracker_viewport(&snapshot, &state, 120, 20);
 
-    assert!(rows.iter().any(|row| row.trim().chars().all(|ch| ch == '─')));
-    assert!(rows.iter().any(|row| row.starts_with("  PRD: Detail polish")));
-    assert!(rows.iter().any(|row| row.starts_with("  Readable details") && row.contains("final phrase stays on one line")));
+    assert!(
+        rows.iter()
+            .any(|row| row.trim().chars().all(|ch| ch == '─'))
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("  PRD: Detail polish"))
+    );
+    assert!(rows.iter().any(|row| row.starts_with("  Readable details")
+        && row.contains("final phrase stays on one line")));
     assert!(rows.iter().all(|row| !row.contains(" │ ")));
 }
 
@@ -708,7 +841,10 @@ fn tracker_rows_align_prd_status_and_progress_columns() {
 
     let rows = render_tracker_rows(&snapshot, &state, 90);
     let active = rows.iter().find(|row| row.contains("Active PRD")).unwrap();
-    let complete = rows.iter().find(|row| row.contains("Complete PRD")).unwrap();
+    let complete = rows
+        .iter()
+        .find(|row| row.contains("Complete PRD"))
+        .unwrap();
 
     assert_eq!(active.find("● in progress"), complete.find("✓ complete"));
     assert_eq!(active.find("0/1"), complete.find("1/1"));

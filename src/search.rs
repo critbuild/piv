@@ -22,16 +22,22 @@ impl SearchQuery {
 
     pub fn find<'a>(&self, lines: impl IntoIterator<Item = (usize, &'a str)>) -> Vec<Match> {
         if self.is_empty() { return Vec::new(); }
-        let needle = if self.case_sensitive { self.text.clone() } else { self.text.to_lowercase() };
+        let needle = if self.case_sensitive {
+            self.text.chars().collect::<Vec<_>>()
+        } else {
+            self.text.to_lowercase().chars().collect::<Vec<_>>()
+        };
+        if needle.is_empty() { return Vec::new(); }
         let mut out = Vec::new();
         for (line, text) in lines {
-            let haystack: Vec<char> = text.chars().collect();
-            let cmp: Vec<char> = if self.case_sensitive { haystack.clone() } else { haystack.iter().map(|c| c.to_ascii_lowercase()).collect() };
-            let needle: Vec<char> = needle.chars().collect();
-            if needle.is_empty() { continue; }
+            let haystack = if self.case_sensitive {
+                text.chars().collect::<Vec<_>>()
+            } else {
+                text.chars().map(|c| c.to_ascii_lowercase()).collect::<Vec<_>>()
+            };
             let mut i = 0;
-            while i + needle.len() <= cmp.len() {
-                if cmp[i..i + needle.len()] == needle[..] {
+            while i + needle.len() <= haystack.len() {
+                if haystack[i..i + needle.len()] == needle[..] {
                     out.push(Match { line, column: i, end: i + needle.len() });
                     i += needle.len();
                 } else {
@@ -103,6 +109,23 @@ mod tests {
             Match { line: 0, column: 0, end: 2 },
             Match { line: 0, column: 2, end: 4 },
         ]);
+    }
+
+    #[test]
+    fn matches_use_character_offsets_with_ascii_case_folding() {
+        let q = SearchQuery::new("foo");
+        let m = find_all(&q, &["lambda: \u{03bb} FOO foo"]);
+        assert_eq!(m, vec![
+            Match { line: 0, column: 10, end: 13 },
+            Match { line: 0, column: 14, end: 17 },
+        ]);
+    }
+
+    #[test]
+    fn case_insensitive_search_preserves_non_ascii_case_asymmetry() {
+        let q = SearchQuery::new("\u{00e9}");
+        let m = find_all(&q, &["\u{00c9} \u{00e9}"]);
+        assert_eq!(m, vec![Match { line: 0, column: 2, end: 3 }]);
     }
 
     #[test]

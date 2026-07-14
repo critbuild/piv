@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, sync::Mutex};
 
 use anyhow::Result;
 use ratatui::{style::{Color, Modifier, Style}, text::Span};
@@ -34,6 +34,7 @@ impl LanguageConfig {
 
 pub struct Highlighter {
     configs: Vec<LanguageConfig>,
+    engine: Mutex<TreeSitterHighlighter>,
 }
 
 impl Highlighter {
@@ -47,16 +48,17 @@ impl Highlighter {
                 LanguageConfig::new(&["jsx"], "jsx", tree_sitter_javascript::LANGUAGE.into(), tree_sitter_javascript::JSX_HIGHLIGHT_QUERY, tree_sitter_javascript::INJECTIONS_QUERY, tree_sitter_javascript::LOCALS_QUERY)?,
                 LanguageConfig::new(&["py"], "python", tree_sitter_python::LANGUAGE.into(), tree_sitter_python::HIGHLIGHTS_QUERY, "", "")?,
             ],
+            engine: Mutex::new(TreeSitterHighlighter::new()),
         })
     }
 
     pub fn highlight_lines(&self, path: &Path, source: &str) -> Vec<Vec<Span<'static>>> {
-        if source.len() > MAX_HIGHLIGHT_BYTES || source.lines().count() > MAX_HIGHLIGHT_LINES {
+        let Some(language) = self.configs.iter().find(|config| config.matches(path)) else { return plain_lines(source); };
+        if source.len() > MAX_HIGHLIGHT_BYTES || source.lines().nth(MAX_HIGHLIGHT_LINES).is_some() {
             return plain_lines(source);
         }
-        let Some(language) = self.configs.iter().find(|config| config.matches(path)) else { return plain_lines(source); };
-        let mut highlighter = TreeSitterHighlighter::new();
-        let Ok(events) = highlighter.highlight(&language.config, source.as_bytes(), None, |_| None) else { return plain_lines(source); };
+        let mut engine = self.engine.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Ok(events) = engine.highlight(&language.config, source.as_bytes(), None, |_| None) else { return plain_lines(source); };
         render_tree_sitter_lines(source, events)
     }
 }
@@ -109,5 +111,44 @@ fn style_for_highlight(index: usize) -> Style {
         n if n.starts_with("operator") || n.starts_with("punctuation") => Style::default().fg(Color::Rgb(171, 178, 191)),
         n if n.starts_with("attribute") || n.starts_with("tag") || n.starts_with("module") => Style::default().fg(Color::Rgb(97, 175, 239)),
         _ => default_code_style(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn highlighter_remains_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Highlighter>();
+    }
+
+    #[test]
+    fn highlight_line_limit_keeps_boundary_and_falls_back_above_it() {
+        let highlighter = Highlighter::new().unwrap();
+        let at_limit = "fn main() {}\n".repeat(MAX_HIGHLIGHT_LINES);
+        let above_limit = "fn main() {}\n".repeat(MAX_HIGHLIGHT_LINES + 1);
+
+        let highlighted = highlighter.highlight_lines(Path::new("main.rs"), &at_limit);
+        assert_eq!(highlighted.len(), MAX_HIGHLIGHT_LINES);
+        assert!(highlighted[0].iter().any(|span| span.style != default_code_style()));
+
+        let plain = highlighter.highlight_lines(Path::new("main.rs"), &above_limit);
+        assert_eq!(plain.len(), MAX_HIGHLIGHT_LINES + 1);
+        assert!(plain.iter().all(|line| {
+            line.len() == 1 && line[0].style == default_code_style()
+        }));
+    }
+
+    #[test]
+    fn repeated_highlighting_with_reused_engine_is_identical() {
+        let highlighter = Highlighter::new().unwrap();
+        let source = "fn main() {\n    println!(\"hello\");\n}\n";
+
+        let first = highlighter.highlight_lines(Path::new("main.rs"), source);
+        let second = highlighter.highlight_lines(Path::new("main.rs"), source);
+
+        assert_eq!(first, second);
     }
 }

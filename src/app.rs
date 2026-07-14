@@ -7,40 +7,41 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use chrono::{DateTime, Local};
 use crossterm::event::{
     self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
-    Frame, Terminal,
 };
 
 use crate::{
     code_pane::{
-        code_prefix_width, prepare_rows, render_code_pane, CodePaneOverlays,
-        RemoteHighlightOverlay, SearchOverlay,
+        CodePaneOverlays, RemoteHighlightOverlay, SearchOverlay, code_prefix_width, prepare_rows,
+        render_code_pane,
     },
     control::{ControlCommand, ControlServer},
     diff::{DiffEngine, LineKind},
-    file_intake::{row_index_for_new_line, FileIntake},
+    file_intake::{FileIntake, row_index_for_new_line},
     highlight::Highlighter,
     issue_cockpit::{
-        build_issue_cockpit_view, match_project_for_root, render_issue_cockpit_lines,
-        tracker_status_fragment, CockpitScopeMode, IssueCockpitState,
+        CockpitScopeMode, IssueCockpitState, build_issue_cockpit_view, match_project_for_root,
+        render_issue_cockpit_lines, tracker_status_fragment,
     },
     model::{Selection, Tab, TabHit, TabManager, TextPoint},
     search::{Match as SearchMatch, SearchQuery},
     tracker::TrackerStore,
     tracker_ui::{
-        max_tracker_detail_scroll, render_tracker_view_lines, visible_items, TrackerItemRef,
-        TrackerViewState,
+        TrackerItemRef, TrackerViewState, max_tracker_detail_scroll, max_tracker_menu_scroll,
+        render_tracker_detail_lines, render_tracker_menu_lines, tracker_menu_item_at_row,
+        visible_items,
     },
     watcher::{FileWatcher, WatchEvent},
 };
@@ -50,6 +51,8 @@ use arboard::Clipboard;
 const MAX_TABS: usize = 10;
 const BATCH_WINDOW: Duration = Duration::from_millis(120);
 const MOUSE_SCROLL_LINES: usize = 5;
+const TRACKER_MIN_PANE_WIDTH: u16 = 24;
+const TRACKER_WIDE_MIN_WIDTH: u16 = TRACKER_MIN_PANE_WIDTH * 2 + 1;
 const FALLBACK_SCAN_INTERVAL: Duration = Duration::from_millis(750);
 const FALLBACK_SCAN_IDLE_DELAY: Duration = Duration::from_millis(1200);
 const GIT_REF_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
@@ -111,6 +114,12 @@ pub struct App {
     tracker_view: TrackerViewState,
     tracker_scope_mode: CockpitScopeMode,
     tracker_notice: Option<String>,
+    tracker_area: Rect,
+    tracker_menu_area: Rect,
+    tracker_divider_area: Rect,
+    tracker_detail_area: Rect,
+    tracker_menu_width: Option<u16>,
+    tracker_divider_dragging: bool,
     issue_cockpit: IssueCockpitState,
     issue_cockpit_area: Rect,
 }
@@ -164,6 +173,12 @@ impl App {
             tracker_view: TrackerViewState::default(),
             tracker_scope_mode: CockpitScopeMode::Auto,
             tracker_notice: None,
+            tracker_area: Rect::default(),
+            tracker_menu_area: Rect::default(),
+            tracker_divider_area: Rect::default(),
+            tracker_detail_area: Rect::default(),
+            tracker_menu_width: None,
+            tracker_divider_dragging: false,
             issue_cockpit: IssueCockpitState::default(),
             issue_cockpit_area: Rect::default(),
         };
@@ -549,6 +564,9 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            self.tracker_divider_dragging = false;
+        }
         if self.in_tracker_mode() {
             self.handle_tracker_mouse(mouse);
             return;
@@ -878,31 +896,22 @@ impl App {
     }
 
     fn render_tracker(&mut self, f: &mut Frame, area: Rect) {
-        let rows = match self
+        self.set_tracker_layout(area);
+        let snapshot = self
             .tracker
             .as_ref()
-            .and_then(|tracker| tracker.snapshot().ok())
-        {
+            .and_then(|tracker| tracker.snapshot().ok());
+
+        let menu_rows = match snapshot {
             Some(raw_snapshot) => {
                 let header = self.tracker_scope_header(&raw_snapshot);
                 let snapshot = self.scope_tracker_snapshot(raw_snapshot);
-                let item_count = visible_items(&snapshot, &self.tracker_view).len();
-                if item_count > 0 && self.tracker_view.selected >= item_count {
-                    self.tracker_view.selected = item_count - 1;
-                    self.tracker_view.reset_detail_scroll();
-                }
-                let max_scroll = max_tracker_detail_scroll(
+                self.clamp_tracker_offsets(&snapshot);
+                let mut rows = render_tracker_menu_lines(
                     &snapshot,
                     &self.tracker_view,
-                    area.width as usize,
-                    area.height as usize,
-                );
-                self.tracker_view.clamp_detail_scroll(max_scroll);
-                let mut rows = render_tracker_view_lines(
-                    &snapshot,
-                    &self.tracker_view,
-                    area.width as usize,
-                    area.height as usize,
+                    self.tracker_menu_area.width as usize,
+                    self.tracker_menu_area.height as usize,
                 );
                 if let Some(first) = rows.first_mut() {
                     *first = Line::styled(
@@ -911,6 +920,15 @@ impl App {
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     );
+                }
+                if self.tracker_detail_area.width > 0 {
+                    let detail_rows = render_tracker_detail_lines(
+                        &snapshot,
+                        &self.tracker_view,
+                        self.tracker_detail_area.width as usize,
+                        self.tracker_detail_area.height as usize,
+                    );
+                    f.render_widget(Paragraph::new(detail_rows), self.tracker_detail_area);
                 }
                 rows
             }
@@ -924,7 +942,13 @@ impl App {
                 ),
             ],
         };
-        f.render_widget(Paragraph::new(rows), area);
+        f.render_widget(Paragraph::new(menu_rows), self.tracker_menu_area);
+        if self.tracker_divider_area.width > 0 {
+            let divider = (0..self.tracker_divider_area.height)
+                .map(|_| Line::styled("│", Style::default().fg(Color::DarkGray)))
+                .collect::<Vec<_>>();
+            f.render_widget(Paragraph::new(divider), self.tracker_divider_area);
+        }
     }
 
     fn render_status(&self, f: &mut Frame, area: Rect) {
@@ -1101,6 +1125,39 @@ fn issue_cockpit_height(total_height: u16, prompting: bool) -> u16 {
     let available = total_height.saturating_sub(reserved + 1);
     let preferred = (total_height / 3).clamp(6, 12);
     preferred.min(available).max(1)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TrackerPaneLayout {
+    menu: Rect,
+    divider: Rect,
+    detail: Rect,
+}
+
+fn tracker_pane_layout(area: Rect, requested_menu_width: Option<u16>) -> TrackerPaneLayout {
+    if area.width < TRACKER_WIDE_MIN_WIDTH || area.height == 0 {
+        return TrackerPaneLayout {
+            menu: area,
+            ..TrackerPaneLayout::default()
+        };
+    }
+
+    let max_menu_width = area.width - TRACKER_MIN_PANE_WIDTH - 1;
+    let default_menu_width = area.width.saturating_mul(2) / 5;
+    let menu_width = requested_menu_width
+        .unwrap_or(default_menu_width)
+        .clamp(TRACKER_MIN_PANE_WIDTH, max_menu_width);
+    let divider_x = area.x.saturating_add(menu_width);
+    TrackerPaneLayout {
+        menu: Rect::new(area.x, area.y, menu_width, area.height),
+        divider: Rect::new(divider_x, area.y, 1, area.height),
+        detail: Rect::new(
+            divider_x.saturating_add(1),
+            area.y,
+            area.width - menu_width - 1,
+            area.height,
+        ),
+    }
 }
 
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
@@ -1302,15 +1359,54 @@ impl App {
         matches!(self.mode, InteractionMode::Tracker)
     }
 
+    fn set_tracker_layout(&mut self, area: Rect) {
+        self.tracker_area = area;
+        let layout = tracker_pane_layout(area, self.tracker_menu_width);
+        self.tracker_menu_area = layout.menu;
+        self.tracker_divider_area = layout.divider;
+        self.tracker_detail_area = layout.detail;
+    }
+
+    fn clamp_tracker_offsets(&mut self, snapshot: &crate::tracker::TrackerSnapshot) {
+        let item_count = visible_items(snapshot, &self.tracker_view).len();
+        self.tracker_view.clamp_selection(item_count);
+        let max_menu_scroll = max_tracker_menu_scroll(
+            snapshot,
+            &self.tracker_view,
+            self.tracker_menu_area.height as usize,
+        );
+        self.tracker_view.clamp_menu_scroll(max_menu_scroll);
+        let max_detail_scroll = if self.tracker_detail_area.width == 0 {
+            0
+        } else {
+            max_tracker_detail_scroll(
+                snapshot,
+                &self.tracker_view,
+                self.tracker_detail_area.width as usize,
+                self.tracker_detail_area.height as usize,
+            )
+        };
+        self.tracker_view.clamp_detail_scroll(max_detail_scroll);
+    }
+
     fn handle_tracker_key(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => self.mode = InteractionMode::Code,
+            (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
+                self.tracker_divider_dragging = false;
+                self.mode = InteractionMode::Code;
+            }
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
                 if let Some(snapshot) = self.tracker_snapshot() {
                     self.tracker_view.move_down(&snapshot);
+                    self.tracker_view
+                        .reveal_selected(self.tracker_menu_area.height as usize);
                 }
             }
-            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.tracker_view.move_up(),
+            (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
+                self.tracker_view.move_up();
+                self.tracker_view
+                    .reveal_selected(self.tracker_menu_area.height as usize);
+            }
             (KeyCode::PageDown, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 self.tracker_view.scroll_detail_down(10)
             }
@@ -1326,27 +1422,91 @@ impl App {
             (KeyCode::Char('p'), _) => self.cycle_selected_prd_status(),
             _ => {}
         }
+        if self.tracker_area.width > 0 {
+            if let Some(snapshot) = self.tracker_snapshot() {
+                self.clamp_tracker_offsets(&snapshot);
+            }
+        }
     }
 
     fn handle_tracker_mouse(&mut self, mouse: MouseEvent) {
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            self.tracker_divider_dragging = false;
+            return;
+        }
+
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.tracker_view.scroll_detail_up(MOUSE_SCROLL_LINES),
-            MouseEventKind::ScrollDown => self.tracker_view.scroll_detail_down(MOUSE_SCROLL_LINES),
+            MouseEventKind::ScrollUp => {
+                if rect_contains(self.tracker_menu_area, mouse.column, mouse.row) {
+                    self.tracker_view.scroll_menu_up(MOUSE_SCROLL_LINES);
+                } else if rect_contains(self.tracker_detail_area, mouse.column, mouse.row) {
+                    self.tracker_view.scroll_detail_up(MOUSE_SCROLL_LINES);
+                } else {
+                    return;
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if rect_contains(self.tracker_menu_area, mouse.column, mouse.row) {
+                    self.tracker_view.scroll_menu_down(MOUSE_SCROLL_LINES);
+                } else if rect_contains(self.tracker_detail_area, mouse.column, mouse.row) {
+                    self.tracker_view.scroll_detail_down(MOUSE_SCROLL_LINES);
+                } else {
+                    return;
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
+                if rect_contains(self.tracker_divider_area, mouse.column, mouse.row) {
+                    self.tracker_divider_dragging = true;
+                    return;
+                }
+                if !rect_contains(self.tracker_menu_area, mouse.column, mouse.row) {
+                    return;
+                }
                 let Some(snapshot) = self.tracker_snapshot() else {
                     return;
                 };
-                let row = usize::from(mouse.row).saturating_sub(2);
-                let item_count = visible_items(&snapshot, &self.tracker_view).len();
-                if row < item_count {
-                    if self.tracker_view.selected != row {
-                        self.tracker_view.selected = row;
-                        self.tracker_view.reset_detail_scroll();
+                let local_row = usize::from(mouse.row - self.tracker_menu_area.y);
+                let Some(index) = tracker_menu_item_at_row(
+                    &snapshot,
+                    &self.tracker_view,
+                    local_row,
+                    self.tracker_menu_area.height as usize,
+                ) else {
+                    return;
+                };
+                let item = visible_items(&snapshot, &self.tracker_view)
+                    .get(index)
+                    .map(|row| row.item.clone());
+                self.tracker_view.select(index);
+                match item {
+                    Some(TrackerItemRef::Project { project_key }) => {
+                        self.tracker_view.toggle(&format!("project:{project_key}"))
                     }
-                    self.toggle_selected_tracker_row();
+                    Some(TrackerItemRef::Prd {
+                        project_key,
+                        prd_key,
+                    }) => self
+                        .tracker_view
+                        .toggle(&format!("prd:{project_key}/{prd_key}")),
+                    Some(TrackerItemRef::Issue { .. }) | None => {}
                 }
             }
-            _ => {}
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if !self.tracker_divider_dragging
+                    || self.tracker_area.width < TRACKER_WIDE_MIN_WIDTH
+                {
+                    return;
+                }
+                let desired = mouse.column.saturating_sub(self.tracker_area.x);
+                let max_width = self.tracker_area.width - TRACKER_MIN_PANE_WIDTH - 1;
+                self.tracker_menu_width = Some(desired.clamp(TRACKER_MIN_PANE_WIDTH, max_width));
+                self.set_tracker_layout(self.tracker_area);
+            }
+            _ => return,
+        }
+
+        if let Some(snapshot) = self.tracker_snapshot() {
+            self.clamp_tracker_offsets(&snapshot);
         }
     }
 
@@ -1402,7 +1562,8 @@ impl App {
             CockpitScopeMode::Auto => CockpitScopeMode::AllProjects,
             CockpitScopeMode::AllProjects => CockpitScopeMode::Auto,
         };
-        self.tracker_view.selected = 0;
+        self.tracker_view.select(0);
+        self.tracker_view.menu_scroll = 0;
         self.tracker_view.reset_detail_scroll();
     }
 
@@ -1994,9 +2155,10 @@ mod tests {
 
         app.handle_tracker_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         assert!(app.tracker_scope_header(&raw).contains("scope all"));
-        assert!(app
-            .tracker_scope_header(&raw)
-            .contains("a: current project"));
+        assert!(
+            app.tracker_scope_header(&raw)
+                .contains("a: current project")
+        );
         let all = app.tracker_snapshot().unwrap();
         assert_eq!(all.projects.len(), 2);
     }
@@ -2202,38 +2364,300 @@ mod tests {
         assert_eq!(app.tracker_view.detail_scroll, 0);
     }
 
-    #[test]
-    fn tracker_mouse_wheel_scrolls_detail_without_moving_menu_selection() {
+    fn tracker_mouse_test_app() -> (tempfile::TempDir, App) {
         use std::fs;
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let mut store = TrackerStore::open_in_memory().unwrap();
+        store.create_project("piv", "piv", &[]).unwrap();
+        store
+            .upsert_plan(
+                "piv",
+                crate::tracker::PrdInput {
+                    key: "mouse".into(),
+                    title: "Mouse interactions".into(),
+                    status: crate::tracker::PrdStatus::InProgress,
+                    body: Some(
+                        (1..=40)
+                            .map(|line| format!("long detail line {line}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                    source_uri: None,
+                },
+                (1..=12)
+                    .map(|position| crate::tracker::PlanIssueInput {
+                        key: format!("issue-{position}"),
+                        title: format!("Issue {position}"),
+                        status: crate::tracker::IssueStatus::Open,
+                        body: None,
+                        position,
+                        depends_on: vec![],
+                    })
+                    .collect(),
+            )
+            .unwrap();
 
-        let mut app = App::new(root.to_path_buf()).unwrap();
-        app.enter_tracker_mode();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.mode = InteractionMode::Tracker;
+        app.tracker = Some(store);
+        app.tracker_view.expand("project:piv");
+        app.tracker_view.expand("prd:piv/mouse");
+        app.tracker_view.selected = 1;
+        app.set_tracker_layout(Rect::new(10, 5, 100, 10));
+        (dir, app)
+    }
+
+    fn tracker_mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn tracker_mouse_wheels_are_pane_local_and_ignore_divider_and_outside() {
+        let (_dir, mut app) = tracker_mouse_test_app();
         let selected = app.tracker_view.selected;
 
-        app.handle_tracker_mouse(MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        });
-
-        assert_eq!(app.tracker_view.selected, selected);
-        assert!(app.tracker_view.detail_scroll > 0);
-
-        app.handle_tracker_mouse(MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        });
-
-        assert_eq!(app.tracker_view.selected, selected);
+        app.handle_tracker_mouse(tracker_mouse(MouseEventKind::ScrollDown, 11, 8));
+        assert_eq!(app.tracker_view.menu_scroll, MOUSE_SCROLL_LINES);
         assert_eq!(app.tracker_view.detail_scroll, 0);
+        assert_eq!(app.tracker_view.selected, selected);
+
+        app.handle_tracker_mouse(tracker_mouse(MouseEventKind::ScrollDown, 52, 8));
+        assert_eq!(app.tracker_view.menu_scroll, MOUSE_SCROLL_LINES);
+        assert_eq!(app.tracker_view.detail_scroll, MOUSE_SCROLL_LINES);
+        assert_eq!(app.tracker_view.selected, selected);
+
+        let before = app.tracker_view.clone();
+        app.handle_tracker_mouse(tracker_mouse(MouseEventKind::ScrollDown, 50, 8));
+        app.handle_tracker_mouse(tracker_mouse(MouseEventKind::ScrollUp, 2, 2));
+        assert_eq!(app.tracker_view, before);
+    }
+
+    #[test]
+    fn tracker_mouse_row_clicks_map_after_scroll_and_only_branches_toggle() {
+        let (_dir, mut app) = tracker_mouse_test_app();
+        app.tracker_view.detail_scroll = 9;
+
+        app.handle_tracker_mouse(tracker_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            12,
+            9,
+        ));
+        assert_eq!(app.tracker_view.selected, 2);
+        assert_eq!(app.tracker_view.detail_scroll, 0);
+        assert!(app.tracker_view.is_expanded("project:piv"));
+        assert!(app.tracker_view.is_expanded("prd:piv/mouse"));
+
+        app.tracker_view.menu_scroll = 5;
+        app.handle_tracker_mouse(tracker_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            12,
+            7,
+        ));
+        assert_eq!(app.tracker_view.selected, 5);
+
+        app.tracker_view.menu_scroll = 0;
+        app.handle_tracker_mouse(tracker_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            12,
+            7,
+        ));
+        assert_eq!(app.tracker_view.selected, 0);
+        assert!(!app.tracker_view.is_expanded("project:piv"));
+        app.handle_tracker_mouse(tracker_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            12,
+            7,
+        ));
+        assert!(app.tracker_view.is_expanded("project:piv"));
+        app.handle_tracker_mouse(tracker_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            12,
+            8,
+        ));
+        assert!(!app.tracker_view.is_expanded("prd:piv/mouse"));
+    }
+
+    #[test]
+    fn tracker_mouse_non_menu_clicks_and_blank_rows_do_not_activate_items() {
+        let (_dir, mut app) = tracker_mouse_test_app();
+        app.tracker_view.collapse("project:piv");
+        app.tracker_view.selected = 0;
+        let selected = app.tracker_view.selected;
+        let expanded = app.tracker_view.is_expanded("project:piv");
+
+        for (column, row) in [(12, 5), (12, 6), (12, 10), (52, 8), (2, 2)] {
+            app.handle_tracker_mouse(tracker_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+            ));
+        }
+        app.handle_tracker_mouse(tracker_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            50,
+            8,
+        ));
+        app.handle_tracker_mouse(tracker_mouse(MouseEventKind::Up(MouseButton::Left), 2, 2));
+
+        assert_eq!(app.tracker_view.selected, selected);
+        assert_eq!(app.tracker_view.is_expanded("project:piv"), expanded);
+    }
+
+    #[test]
+    fn tracker_divider_drag_resizes_clamps_and_release_stops_dragging() {
+        let (_dir, mut app) = tracker_mouse_test_app();
+        app.handle_tracker_mouse(tracker_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            50,
+            8,
+        ));
+        assert!(app.tracker_divider_dragging);
+
+        app.handle_tracker_mouse(tracker_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            45,
+            30,
+        ));
+        assert_eq!(app.tracker_menu_area.width, 35);
+        app.handle_tracker_mouse(tracker_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            u16::MAX,
+            0,
+        ));
+        assert_eq!(app.tracker_menu_area.width, 75);
+        assert_eq!(app.tracker_detail_area.width, TRACKER_MIN_PANE_WIDTH);
+
+        app.tracker_view.menu_scroll = usize::MAX;
+        app.tracker_view.detail_scroll = usize::MAX;
+        app.handle_tracker_mouse(tracker_mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0));
+        assert_eq!(app.tracker_menu_area.width, TRACKER_MIN_PANE_WIDTH);
+        let snapshot = app.tracker_snapshot().unwrap();
+        assert_eq!(
+            app.tracker_view.menu_scroll,
+            max_tracker_menu_scroll(
+                &snapshot,
+                &app.tracker_view,
+                app.tracker_menu_area.height as usize
+            )
+        );
+        assert_eq!(
+            app.tracker_view.detail_scroll,
+            max_tracker_detail_scroll(
+                &snapshot,
+                &app.tracker_view,
+                app.tracker_detail_area.width as usize,
+                app.tracker_detail_area.height as usize
+            )
+        );
+
+        app.handle_tracker_mouse(tracker_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            u16::MAX,
+            0,
+        ));
+        assert_eq!(app.tracker_menu_area.width, 75);
+        app.handle_tracker_mouse(tracker_mouse(MouseEventKind::Up(MouseButton::Left), 0, 0));
+        assert!(!app.tracker_divider_dragging);
+        app.handle_tracker_mouse(tracker_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            50,
+            8,
+        ));
+        assert_eq!(app.tracker_menu_area.width, 75);
+    }
+
+    #[test]
+    fn tracker_layout_has_safe_narrow_fallback_and_non_zero_origins() {
+        let narrow = tracker_pane_layout(Rect::new(7, 3, 48, 9), Some(30));
+        assert_eq!(narrow.menu, Rect::new(7, 3, 48, 9));
+        assert_eq!(narrow.divider, Rect::default());
+        assert_eq!(narrow.detail, Rect::default());
+
+        let wide = tracker_pane_layout(Rect::new(7, 3, 80, 9), Some(30));
+        assert_eq!(wide.menu, Rect::new(7, 3, 30, 9));
+        assert_eq!(wide.divider, Rect::new(37, 3, 1, 9));
+        assert_eq!(wide.detail, Rect::new(38, 3, 49, 9));
+    }
+
+    #[test]
+    fn tracker_terminal_resize_during_divider_drag_remains_safe_until_release() {
+        let (_dir, mut app) = tracker_mouse_test_app();
+        app.handle_tracker_mouse(tracker_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            50,
+            8,
+        ));
+        assert!(app.tracker_divider_dragging);
+
+        app.set_tracker_layout(Rect::new(7, 3, 40, 9));
+        app.handle_tracker_mouse(tracker_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            20,
+            5,
+        ));
+        assert_eq!(app.tracker_menu_area, Rect::new(7, 3, 40, 9));
+        assert_eq!(app.tracker_divider_area, Rect::default());
+        assert_eq!(app.tracker_detail_area, Rect::default());
+
+        app.handle_tracker_mouse(tracker_mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            200,
+            200,
+        ));
+        assert!(!app.tracker_divider_dragging);
+        app.set_tracker_layout(Rect::new(7, 3, 80, 9));
+        assert!(app.tracker_divider_area.width > 0);
+        assert!(app.tracker_detail_area.width >= TRACKER_MIN_PANE_WIDTH);
+    }
+
+    #[test]
+    fn tracker_q_and_escape_disarm_an_active_divider_drag() {
+        for exit_key in [KeyCode::Char('q'), KeyCode::Esc] {
+            let (_dir, mut app) = tracker_mouse_test_app();
+            app.handle_mouse(tracker_mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                50,
+                8,
+            ));
+            assert!(app.tracker_divider_dragging);
+
+            app.handle_tracker_key(KeyEvent::new(exit_key, KeyModifiers::NONE));
+
+            assert_eq!(app.mode, InteractionMode::Code);
+            assert!(!app.tracker_divider_dragging);
+        }
+    }
+
+    #[test]
+    fn tracker_release_in_code_mode_disarms_resize_before_reentry() {
+        let (_dir, mut app) = tracker_mouse_test_app();
+        app.handle_mouse(tracker_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            50,
+            8,
+        ));
+        assert!(app.tracker_divider_dragging);
+
+        app.mode = InteractionMode::Code;
+        app.handle_mouse(tracker_mouse(MouseEventKind::Up(MouseButton::Left), 2, 2));
+        assert!(!app.tracker_divider_dragging);
+
+        app.enter_tracker_mode();
+        let width = app.tracker_menu_area.width;
+        app.handle_mouse(tracker_mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            45,
+            8,
+        ));
+        assert_eq!(app.tracker_menu_area.width, width);
     }
 
     #[test]
@@ -2470,9 +2894,10 @@ mod tests {
             .mouse_point_to_text_point(10 + code_prefix_width() as u16 + 2, 5)
             .unwrap();
         assert_eq!(point, TextPoint { line: 0, column: 2 });
-        assert!(app
-            .mouse_point_to_text_point(10 + code_prefix_width() as u16 + 2, 4)
-            .is_none());
+        assert!(
+            app.mouse_point_to_text_point(10 + code_prefix_width() as u16 + 2, 4)
+                .is_none()
+        );
     }
 
     #[test]

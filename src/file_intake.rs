@@ -141,11 +141,11 @@ impl FileIntake {
         let old_snapshot = self
             .snapshots
             .get(&path)
-            .cloned()
-            .unwrap_or_else(|| content.clone());
+            .map(String::as_str)
+            .unwrap_or(content.as_str());
         let diff = self.diff_for_content(&path, &content, reference_content.as_deref());
         let first_change = first_changed_row(&diff);
-        let focus_line = latest_snapshot_change_line(&old_snapshot, &content)
+        let focus_line = latest_snapshot_change_line(old_snapshot, &content)
             .and_then(|line| row_index_for_new_line(&diff, line))
             .or_else(|| {
                 diff.iter()
@@ -312,5 +312,39 @@ mod tests {
             .unwrap();
 
         assert!(scan.is_empty());
+    }
+
+    #[test]
+    fn changed_file_uses_snapshot_delta_for_focus_with_reference_diff() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let path = root.join("main.rs");
+        let snapshot = "zero\none\ntwo\nthree\n";
+        let reference = "reference\none\ntwo\nthree\n";
+        let changed = "zero\none\ntwo\nTHREE\n";
+        fs::write(&path, snapshot).unwrap();
+
+        let highlighter = Highlighter::new().unwrap();
+        let mut intake = FileIntake::new(root);
+        intake
+            .load_changed(path.clone(), SystemTime::UNIX_EPOCH, &highlighter, None)
+            .unwrap();
+
+        fs::write(&path, changed).unwrap();
+        let tab = intake
+            .load_changed(
+                path.clone(),
+                SystemTime::UNIX_EPOCH,
+                &highlighter,
+                Some(reference.to_string()),
+            )
+            .unwrap();
+
+        assert!(tab.diff.iter().any(|row| {
+            row.kind == LineKind::Added && row.new_line_no == Some(1)
+        }));
+        let focus = tab.focus_line.expect("snapshot delta should select a row");
+        assert_eq!(tab.diff[focus].new_line_no, Some(4));
+        assert_eq!(intake.snapshot(&path), Some(changed));
     }
 }

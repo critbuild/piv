@@ -1,18 +1,21 @@
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::Line,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::tracker::{Issue, IssueStatus, Prd, Project, TrackerSnapshot};
 
 const DETAIL_HORIZONTAL_PADDING: usize = 2;
+const MENU_HEADER_ROWS: usize = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackerViewState {
     pub selected: usize,
+    #[serde(default)]
+    pub menu_scroll: usize,
     pub detail_scroll: usize,
     expanded: BTreeSet<String>,
 }
@@ -51,6 +54,46 @@ impl TrackerViewState {
         let before = self.selected;
         self.selected = self.selected.saturating_sub(1);
         if self.selected != before {
+            self.detail_scroll = 0;
+        }
+    }
+
+    pub fn select(&mut self, index: usize) {
+        if self.selected != index {
+            self.selected = index;
+            self.detail_scroll = 0;
+        }
+    }
+
+    pub fn scroll_menu_down(&mut self, amount: usize) {
+        self.menu_scroll = self.menu_scroll.saturating_add(amount);
+    }
+
+    pub fn scroll_menu_up(&mut self, amount: usize) {
+        self.menu_scroll = self.menu_scroll.saturating_sub(amount);
+    }
+
+    pub fn clamp_menu_scroll(&mut self, max_scroll: usize) {
+        self.menu_scroll = self.menu_scroll.min(max_scroll);
+    }
+
+    pub fn reveal_selected(&mut self, menu_height: usize) {
+        let body_height = menu_height.saturating_sub(MENU_HEADER_ROWS);
+        if body_height == 0 {
+            self.menu_scroll = 0;
+        } else if self.selected < self.menu_scroll {
+            self.menu_scroll = self.selected;
+        } else if self.selected >= self.menu_scroll.saturating_add(body_height) {
+            self.menu_scroll = self.selected.saturating_add(1).saturating_sub(body_height);
+        }
+    }
+
+    pub fn clamp_selection(&mut self, item_count: usize) {
+        if item_count == 0 {
+            self.selected = 0;
+            self.detail_scroll = 0;
+        } else if self.selected >= item_count {
+            self.selected = item_count - 1;
             self.detail_scroll = 0;
         }
     }
@@ -128,6 +171,122 @@ pub fn render_tracker_rows(
     rows
 }
 
+pub fn max_tracker_menu_scroll(
+    snapshot: &TrackerSnapshot,
+    state: &TrackerViewState,
+    height: usize,
+) -> usize {
+    visible_items(snapshot, state)
+        .len()
+        .saturating_sub(height.saturating_sub(MENU_HEADER_ROWS))
+}
+
+pub fn tracker_menu_item_at_row(
+    snapshot: &TrackerSnapshot,
+    state: &TrackerViewState,
+    local_row: usize,
+    height: usize,
+) -> Option<usize> {
+    if local_row < MENU_HEADER_ROWS || local_row >= height {
+        return None;
+    }
+    let index = state
+        .menu_scroll
+        .saturating_add(local_row.saturating_sub(MENU_HEADER_ROWS));
+    (index < visible_items(snapshot, state).len()).then_some(index)
+}
+
+pub fn render_tracker_menu_viewport(
+    snapshot: &TrackerSnapshot,
+    state: &TrackerViewState,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    if height == 0 {
+        return Vec::new();
+    }
+    let mut rows = vec![
+        fit_width("Project / PRD / Issue tree".to_string(), width),
+        "─".repeat(width),
+    ];
+    let items = visible_items(snapshot, state);
+    let body_height = height.saturating_sub(MENU_HEADER_ROWS);
+    if items.is_empty() && body_height > 0 {
+        rows.push(fit_width(
+            "No tracker projects yet. Ask an AI agent to call project.create or prd.upsert_plan."
+                .to_string(),
+            width,
+        ));
+    } else {
+        rows.extend(
+            items
+                .into_iter()
+                .enumerate()
+                .skip(state.menu_scroll)
+                .take(body_height)
+                .map(|(index, row)| {
+                    let prefix = if index == state.selected {
+                        "› "
+                    } else {
+                        "  "
+                    };
+                    format_tracker_row(prefix, &row, width)
+                }),
+        );
+    }
+    rows.truncate(height);
+    rows.resize(height, String::new());
+    rows
+}
+
+pub fn render_tracker_menu_lines(
+    snapshot: &TrackerSnapshot,
+    state: &TrackerViewState,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    render_tracker_menu_viewport(snapshot, state, width, height)
+        .into_iter()
+        .map(styled_tracker_line)
+        .collect()
+}
+
+pub fn render_tracker_detail_viewport(
+    snapshot: &TrackerSnapshot,
+    state: &TrackerViewState,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    if height == 0 {
+        return Vec::new();
+    }
+    let detail_width = detail_text_width(width);
+    let details = wrap_lines(
+        render_tracker_detail(snapshot, state, detail_width),
+        detail_width,
+    );
+    let mut rows = pad_detail_rows(
+        detail_viewport(details, state.detail_scroll, detail_width, height),
+        DETAIL_HORIZONTAL_PADDING,
+        width,
+    );
+    rows.truncate(height);
+    rows.resize(height, String::new());
+    rows
+}
+
+pub fn render_tracker_detail_lines(
+    snapshot: &TrackerSnapshot,
+    state: &TrackerViewState,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    render_tracker_detail_viewport(snapshot, state, width, height)
+        .into_iter()
+        .map(styled_tracker_line)
+        .collect()
+}
+
 pub fn render_tracker_view(
     snapshot: &TrackerSnapshot,
     state: &TrackerViewState,
@@ -177,22 +336,28 @@ fn render_tracker_view_with_height(
         tree[1] = "─".repeat(width);
     }
 
-    let details = wrap_lines(render_tracker_detail(snapshot, state, detail_width), detail_width);
+    let details = wrap_lines(
+        render_tracker_detail(snapshot, state, detail_width),
+        detail_width,
+    );
     match height {
         Some(height) => {
             if height == 0 {
                 return Vec::new();
             }
-            let menu_height = tree
-                .len()
-                .min(menu_height_limit(height));
+            let menu_height = tree.len().min(menu_height_limit(height));
             let mut rows = tree_menu_viewport(tree, state.selected + 2, menu_height);
             if rows.len() < height {
                 rows.push("─".repeat(width));
             }
             let detail_height = height.saturating_sub(rows.len());
-            let detail_rows = detail_viewport(details, state.detail_scroll, detail_width, detail_height);
-            rows.extend(pad_detail_rows(detail_rows, DETAIL_HORIZONTAL_PADDING, width));
+            let detail_rows =
+                detail_viewport(details, state.detail_scroll, detail_width, detail_height);
+            rows.extend(pad_detail_rows(
+                detail_rows,
+                DETAIL_HORIZONTAL_PADDING,
+                width,
+            ));
             rows.truncate(height);
             rows
         }
@@ -212,11 +377,12 @@ pub fn max_tracker_detail_scroll(
     height: usize,
 ) -> usize {
     let detail_width = detail_text_width(width);
-    let tree_len = render_tracker_rows(snapshot, state, width).len();
-    let menu_height = tree_len.min(menu_height_limit(height));
-    let detail_height = height.saturating_sub(menu_height.saturating_add(1));
-    let detail_len = wrap_lines(render_tracker_detail(snapshot, state, detail_width), detail_width).len();
-    max_detail_scroll_for_len(detail_len, detail_height)
+    let detail_len = wrap_lines(
+        render_tracker_detail(snapshot, state, detail_width),
+        detail_width,
+    )
+    .len();
+    max_detail_scroll_for_len(detail_len, height)
 }
 
 fn detail_text_width(width: usize) -> usize {
@@ -410,17 +576,15 @@ fn render_tracker_detail(
                         ));
                         lines.push(format!("   status  {}", issue_status_label(issue)));
                         if issue.blocked {
-                            lines.push(format!(
-                                "   blocked by {}",
-                                issue.blocked_by_keys.join(",")
-                            ));
+                            lines
+                                .push(format!("   blocked by {}", issue.blocked_by_keys.join(",")));
                         } else if !issue.blocked_by_keys.is_empty() {
-                            lines.push(format!(
-                                "   depends on {}",
-                                issue.blocked_by_keys.join(",")
-                            ));
+                            lines
+                                .push(format!("   depends on {}", issue.blocked_by_keys.join(",")));
                         }
-                        if let Some(body) = issue.body.as_deref().filter(|body| !body.trim().is_empty()) {
+                        if let Some(body) =
+                            issue.body.as_deref().filter(|body| !body.trim().is_empty())
+                        {
                             if let Some(first_line) = body.lines().next() {
                                 lines.push(format!("   notes   {first_line}"));
                             }
@@ -504,7 +668,10 @@ fn render_markdown_line(line: &str) -> String {
 
     let heading_level = trimmed.chars().take_while(|c| *c == '#').count();
     if (1..=6).contains(&heading_level)
-        && trimmed.chars().nth(heading_level).is_some_and(char::is_whitespace)
+        && trimmed
+            .chars()
+            .nth(heading_level)
+            .is_some_and(char::is_whitespace)
     {
         let title = trimmed[heading_level..].trim();
         if heading_level == 1 {
@@ -532,7 +699,9 @@ fn styled_tracker_line(row: String) -> Line<'static> {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else if trimmed.starts_with("┃ ") {
-        Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::ITALIC)
     } else if trimmed.starts_with("Project /")
         || trimmed.starts_with("Details")
         || trimmed.starts_with("PRD:")
@@ -608,8 +777,12 @@ fn tree_menu_viewport(tree: Vec<String>, selected_row: usize, height: usize) -> 
     }
     let body_start = sticky_count;
     let body = &tree[body_start..];
-    let selected = selected_row.saturating_sub(body_start).min(body.len().saturating_sub(1));
-    let start = selected.saturating_sub(body_height / 2).min(body.len().saturating_sub(body_height));
+    let selected = selected_row
+        .saturating_sub(body_start)
+        .min(body.len().saturating_sub(1));
+    let start = selected
+        .saturating_sub(body_height / 2)
+        .min(body.len().saturating_sub(body_height));
     let end = (start + body_height).min(body.len());
 
     let mut rows = tree[..sticky_count].to_vec();
@@ -654,7 +827,7 @@ fn detail_viewport(
     rows.extend(body[scroll..end].iter().cloned());
     rows.push(fit_width(
         format!(
-            "Details {}-{}/{}  PgUp/PgDn scroll",
+            "Details {}-{}/{}  PgUp/PgDn scroll • wheel",
             scroll + 1,
             end,
             body.len()
@@ -671,7 +844,9 @@ fn max_detail_scroll_for_len(detail_len: usize, height: usize) -> usize {
     let sticky_count = detail_len.min(2).min(height.saturating_sub(1));
     let footer_count = 1;
     let body_height = height.saturating_sub(sticky_count + footer_count).max(1);
-    detail_len.saturating_sub(sticky_count).saturating_sub(body_height)
+    detail_len
+        .saturating_sub(sticky_count)
+        .saturating_sub(body_height)
 }
 
 fn wrap_lines(lines: Vec<String>, width: usize) -> Vec<String> {

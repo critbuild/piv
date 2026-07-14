@@ -37,7 +37,7 @@ pub fn code_prefix_width() -> usize { CODE_PREFIX_WIDTH }
 
 pub fn prepare_rows(diff: &[DiffLine], highlighted_lines: &[Vec<Span<'static>>]) -> Vec<PreparedRow> {
     diff.iter().enumerate().map(|(idx, dl)| {
-        let kind = dl.kind.clone();
+        let kind = dl.kind;
         let line_no = dl.new_line_no.or(dl.old_line_no).unwrap_or(idx + 1);
         let leading_ws = leading_whitespace_chars(&dl.text);
         let text_len = dl.text.chars().count();
@@ -63,15 +63,28 @@ pub fn render_code_pane(tab: &mut Tab, height: usize, overlays: CodePaneOverlays
     }
 
     let current_match = overlays.search.and_then(|search| search.matches.get(search.current));
-    tab.diff.iter().zip(tab.prepared_rows.iter()).enumerate().skip(tab.scroll).take(height).map(|(idx, (dl, row))| {
+    let visible_len = tab
+        .diff
+        .len()
+        .min(tab.prepared_rows.len())
+        .saturating_sub(tab.scroll)
+        .min(height);
+    let visible_search_matches = overlays.search.map(|search| {
+        group_visible_search_matches(search.matches, tab.scroll, visible_len)
+    });
+    tab.diff.iter().zip(tab.prepared_rows.iter()).enumerate().skip(tab.scroll).take(height).enumerate().map(|(offset, (idx, (dl, row)))| {
         let line_highlighted = overlays.remote_highlight.is_some_and(|highlight| {
             row.new_line_no.is_some_and(|line| ((highlight.start_line + 1)..=(highlight.end_line + 1)).contains(&line))
         });
-        let line_matches: Vec<&SearchMatch> = overlays.search
-            .map(|search| search.matches.iter().filter(|m| m.line == idx).collect())
-            .unwrap_or_default();
+        let line_matches = visible_search_matches
+            .as_ref()
+            .and_then(|matches| matches.get(offset))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let selection_range = selection_range_for_line(overlays.selection, idx, &dl.text)
+            .filter(|(start, end)| start < end);
 
-        if overlays.selection.is_none() && !line_highlighted && line_matches.is_empty() {
+        if selection_range.is_none() && !line_highlighted && line_matches.is_empty() {
             return row.static_line.clone();
         }
 
@@ -85,15 +98,26 @@ pub fn render_code_pane(tab: &mut Tab, height: usize, overlays: CodePaneOverlays
                 code_spans = apply_style_range(&code_spans, row.leading_ws, row.text_len, highlight.style);
             }
         }
-        if overlays.selection.is_some() {
-            code_spans = apply_selection(&code_spans, selection_range_for_line(overlays.selection, idx, &dl.text));
+        if let Some(range) = selection_range {
+            code_spans = apply_selection(&code_spans, Some(range));
         }
         if !line_matches.is_empty() {
-            code_spans = apply_search_matches(&code_spans, &line_matches, current_match);
+            code_spans = apply_search_matches(&code_spans, line_matches, current_match);
         }
 
         Line::from(row_spans(row.line_no, &row.kind, code_spans))
     }).collect()
+}
+
+fn group_visible_search_matches(matches: &[SearchMatch], scroll: usize, visible_len: usize) -> Vec<Vec<&SearchMatch>> {
+    let mut grouped = (0..visible_len).map(|_| Vec::new()).collect::<Vec<_>>();
+    for search_match in matches {
+        let Some(offset) = search_match.line.checked_sub(scroll) else { continue; };
+        if let Some(line_matches) = grouped.get_mut(offset) {
+            line_matches.push(search_match);
+        }
+    }
+    grouped
 }
 
 fn cached_static_viewport_lines(tab: &mut Tab, height: usize) -> Vec<Line<'static>> {
@@ -271,6 +295,22 @@ mod tests {
     }
 
     #[test]
+    fn render_code_pane_keeps_rows_outside_selection_static() {
+        let mut tab = tab_with(vec![
+            line(LineKind::Unchanged, Some(1), Some(1), "selected"),
+            line(LineKind::Removed, Some(2), None, "outside"),
+        ]);
+        let expected = tab.prepared_rows[1].static_line.clone();
+
+        let lines = render_code_pane(&mut tab, 2, CodePaneOverlays {
+            selection: Some(Selection { anchor: TextPoint { line: 0, column: 0 }, focus: TextPoint { line: 0, column: 4 } }),
+            ..CodePaneOverlays::default()
+        });
+
+        assert_eq!(lines[1], expected);
+    }
+
+    #[test]
     fn render_code_pane_layers_search_current_after_selection() {
         let mut tab = tab_with(vec![line(LineKind::Unchanged, Some(1), Some(1), "hello hello")]);
         let matches = vec![SearchMatch { line: 0, column: 0, end: 5 }, SearchMatch { line: 0, column: 6, end: 11 }];
@@ -282,6 +322,38 @@ mod tests {
         assert_eq!(text(&lines[0]), "   1   │ hello hello");
         assert!(lines[0].spans.iter().any(|span| span.content.as_ref() == "hello" && span.style.bg == search_match_style().bg));
         assert!(lines[0].spans.iter().any(|span| span.content.as_ref() == "hello" && span.style.bg == search_current_style().bg && span.style.add_modifier.contains(Modifier::BOLD)));
+    }
+
+    #[test]
+    fn render_code_pane_groups_visible_search_matches_once() {
+        let mut tab = tab_with(vec![
+            line(LineKind::Unchanged, Some(1), Some(1), "offscreen"),
+            line(LineKind::Unchanged, Some(2), Some(2), "first hit"),
+            line(LineKind::Unchanged, Some(3), Some(3), "hit then hit"),
+        ]);
+        tab.scroll = 1;
+        let matches = vec![
+            SearchMatch { line: 2, column: 9, end: 12 },
+            SearchMatch { line: 0, column: 0, end: 3 },
+            SearchMatch { line: 1, column: 6, end: 9 },
+            SearchMatch { line: 2, column: 0, end: 3 },
+        ];
+
+        let lines = render_code_pane(&mut tab, 2, CodePaneOverlays {
+            search: Some(SearchOverlay { matches: &matches, current: 2 }),
+            ..CodePaneOverlays::default()
+        });
+
+        assert_eq!(lines.iter().map(text).collect::<Vec<_>>(), vec![
+            "   2   │ first hit",
+            "   3   │ hit then hit",
+        ]);
+        assert!(lines[0].spans.iter().any(|span| {
+            span.content.as_ref() == "hit" && span.style.bg == search_current_style().bg
+        }));
+        assert_eq!(lines[1].spans.iter().filter(|span| {
+            span.content.as_ref() == "hit" && span.style.bg == search_match_style().bg
+        }).count(), 2);
     }
 
     #[test]

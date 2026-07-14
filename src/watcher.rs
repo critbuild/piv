@@ -117,7 +117,7 @@ fn is_ignored_component(component: &str) -> bool {
 fn is_ignored_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "pdf" | "json" | "jsonl"))
 }
 
 #[cfg(test)]
@@ -198,12 +198,16 @@ mod tests {
     }
 
     #[test]
-    fn ignore_policy_filters_pdfs() {
+    fn ignore_policy_filters_noisy_extensions() {
         let root = PathBuf::from("/tmp/project");
         let policy = IgnorePolicy::new(&root);
 
         assert!(!policy.allows(&root.join("docs/spec.pdf")));
         assert!(!policy.allows(&root.join("docs/spec.PDF")));
+        assert!(!policy.allows(&root.join("data/package.json")));
+        assert!(!policy.allows(&root.join("data/PACKAGE.JSON")));
+        assert!(!policy.allows(&root.join("data/events.jsonl")));
+        assert!(!policy.allows(&root.join("data/EVENTS.JSONL")));
         assert!(policy.allows(&root.join("docs/spec.md")));
     }
 }
